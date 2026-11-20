@@ -86,36 +86,60 @@ def boundary(g: Graph, U: int) -> int:
     return _union_nin(g.nin, U) & ~U
 
 
-def expand(nin: Sequence[int], full: int, U: int, nb: int) -> tuple[int, int, list[int]]:
-    """Compute U* one vertex at a time.
+def expand(nin: Sequence[int], full: int, U: int, nb: int,
+           greedy2: bool = False) -> tuple[int, int, list[int]]:
+    """Compute the expansion of U one vertex at a time.
 
     ``nb`` must equal the union of nin[u] over u in U.  Returns
-    (U*, union of nin over U*, vertices in the order added).  Each added
-    vertex is subsumed by the set at the moment it is added, so every prefix
-    of the returned order has boundary contained in N(U).  (The order
-    matters: a vertex may become subsumed only after other expansion
-    vertices are added.)
+    (U', union of nin over U', vertices in the order added).
+
+    Rule 1 (Kobayashi subsumption): add x with nin[x] <= U | N(U).  The
+    result of applying rule 1 to a fixpoint is U*.
+
+    Rule 2 (only if ``greedy2``; Coudert, Mazauric and Nisse 2014, Lemma 6,
+    stated there for out-neighbours and mirrored here): add x in N(U) with
+    exactly one in-neighbour outside U | N(U).  The boundary keeps its size.
+
+    Each added vertex satisfies a rule with respect to the set at the moment it
+    is added, so every prefix of the returned order has boundary size at most
+    |N(U)|.  (The order matters: a vertex may qualify only after other
+    vertices have been added.)
     """
     added: list[int] = []
-    closed = U | nb
-    changed = True
-    while changed:
-        changed = False
-        for x in _bits(full & ~U):
-            if nin[x] & ~closed == 0:
-                U |= 1 << x
-                nb |= nin[x]
-                closed = U | nb
-                added.append(x)
-                changed = True
-    return U, nb, added
+    while True:
+        closed = U | nb
+        changed = True
+        while changed:
+            changed = False
+            for x in _bits(full & ~U):
+                if nin[x] & ~closed == 0:
+                    U |= 1 << x
+                    nb |= nin[x]
+                    closed = U | nb
+                    added.append(x)
+                    changed = True
+        if not greedy2:
+            return U, nb, added
+        hit = -1
+        for x in _bits(nb & ~U):
+            if (nin[x] & ~closed).bit_count() == 1:
+                hit = x
+                break
+        if hit < 0:
+            return U, nb, added
+        U |= 1 << hit
+        nb |= nin[hit]
+        added.append(hit)
 
 
-def pathwidth(g: Graph, upper: int | None = None, want_order: bool = True) -> Result:
+def pathwidth(g: Graph, upper: int | None = None, want_order: bool = True,
+              greedy2: bool = False) -> Result:
     """Vertex separation number (= pathwidth) of g, with an optimal ordering.
 
     If ``upper`` is given and pw > upper, returns Result(width=None, ...)
     without exploring any level above ``upper`` (decision version).
+    ``greedy2`` enables the second expansion rule (see ``expand``); the result
+    is the same, usually with fewer sets visited.
     """
     n, nin = g.n, g.nin
     full = (1 << n) - 1
@@ -142,7 +166,7 @@ def pathwidth(g: Graph, upper: int | None = None, want_order: bool = True) -> Re
         if nxt <= n:
             buckets[nxt].append((S, nb))
 
-    S0, nb0, _ = expand(nin, full, 0, 0)
+    S0, nb0, _ = expand(nin, full, 0, 0, greedy2)
     parent[S0] = None
     res.sets_expanded = 1
     res.per_level[0] = 1
@@ -158,7 +182,7 @@ def pathwidth(g: Graph, upper: int | None = None, want_order: bool = True) -> Re
             T = P | (1 << x)
             if T in parent:           # T relevant and already seen => T* = T seen
                 continue
-            T, nbT, _ = expand(nin, full, T, nbP | nin[x])
+            T, nbT, _ = expand(nin, full, T, nbP | nin[x], greedy2)
             if T in parent:
                 continue
             parent[T] = (P, x)
@@ -180,21 +204,21 @@ def pathwidth(g: Graph, upper: int | None = None, want_order: bool = True) -> Re
 
     res.width = c
     if want_order:
-        res.order = [g.labels[v] for v in _extract(nin, full, parent)]
+        res.order = [g.labels[v] for v in _extract(nin, full, parent, greedy2)]
     return res
 
 
-def _extract(nin: Sequence[int], full: int, parent: dict) -> list[int]:
+def _extract(nin: Sequence[int], full: int, parent: dict, greedy2: bool = False) -> list[int]:
     """Chase parent pointers from V back to (empty)*; recompute expansions."""
     segments: list[list[int]] = []
     S = full
     while True:
         link = parent[S]
         if link is None:
-            segments.append(expand(nin, full, 0, 0)[2])
+            segments.append(expand(nin, full, 0, 0, greedy2)[2])
             break
         P, x = link
-        _, _, added = expand(nin, full, P | (1 << x), _union_nin(nin, P) | nin[x])
+        _, _, added = expand(nin, full, P | (1 << x), _union_nin(nin, P) | nin[x], greedy2)
         segments.append([x] + added)
         S = P
     order: list[int] = []

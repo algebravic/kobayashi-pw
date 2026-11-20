@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from typing import Hashable, Iterable
 
 from .core import Graph
@@ -35,26 +37,46 @@ def from_edges(
     return Graph(len(labels), nin, labels)
 
 
+_INT = re.compile(r"-?[0-9]+")
+
+
+def number_names(names: list[str]) -> list[Hashable]:
+    """Vertex labels in processing order, from names in order of first
+    appearance.  If every name is an integer (optional '-', then ASCII digits)
+    and their values are distinct, the labels are those ints in increasing
+    order; otherwise the names themselves in order of first appearance.
+    The C programs (src/C/edgelist.h) use the same rule."""
+    if names and all(_INT.fullmatch(t) for t in names):
+        vals = [int(t) for t in names]
+        if len(set(vals)) == len(vals):
+            return sorted(vals)
+    return list(names)
+
+
 def read_edge_list(path: str, directed: bool = False) -> Graph:
-    """Whitespace-separated 'u v' per line; a lone token is an isolated vertex;
-    '#' starts a comment.  Labels are kept as strings (ints if all numeric)."""
-    edges, verts = [], []
+    """Edge list as in networkx: "u v [data...]" per line, whitespace
+    separated, anything after the first two tokens ignored; a lone token is an
+    isolated vertex; '#' starts a comment.  Vertex names are arbitrary
+    strings; see ``number_names`` for the numbering and the labels."""
+    edges, order, seen = [], [], set()
+
+    def note(t: str) -> None:
+        if t not in seen:
+            seen.add(t)
+            order.append(t)
+
     with open(path) as f:
         for line in f:
             tok = line.split("#", 1)[0].split()
-            if len(tok) == 1:
-                verts.append(tok[0])
-            elif len(tok) >= 2:
-                verts.extend(tok[:2])
+            if not tok:
+                continue
+            note(tok[0])
+            if len(tok) >= 2:
+                note(tok[1])
                 edges.append((tok[0], tok[1]))
-    if all(t.lstrip("-").isdigit() for t in verts):
-        conv = int
-        verts = sorted(set(verts), key=int)
-    else:
-        conv = str
-    return from_edges(
-        ((conv(u), conv(v)) for u, v in edges), map(conv, verts), directed
-    )
+    labels = number_names(order)
+    conv = (lambda t: int(t)) if labels and isinstance(labels[0], int) else (lambda t: t)
+    return from_edges(((conv(u), conv(v)) for u, v in edges), labels, directed)
 
 
 def _decode_n(data: bytes, pos: int) -> tuple[int, int]:

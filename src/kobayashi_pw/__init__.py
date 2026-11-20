@@ -14,6 +14,7 @@ from .core import (
     ordering_width,
 )
 from .io import read_edge_list, read_graph6, from_edges
+from .orders import OrderDAG, optimize, k_best, evaluate, model_v2, model_v7, make_model_v7
 
 __all__ = [
     "Graph",
@@ -25,4 +26,11 @@ __all__ = [
     "read_edge_list",
     "read_graph6",
     "from_edges",
+    "OrderDAG",
+    "optimize",
+    "k_best",
+    "evaluate",
+    "model_v2",
+    "model_v7",
+    "make_model_v7",
 ]

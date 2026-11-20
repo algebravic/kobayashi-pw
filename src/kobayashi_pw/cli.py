@@ -33,6 +33,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="stop if pw > UPPER (decision mode)")
     ap.add_argument("--alg1", type=int, metavar="K", default=None,
                     help="instead run the paper's Algorithm 1 literally for bound K")
+    ap.add_argument("--greedy2", action="store_true",
+                    help="also use Coudert et al.'s second greedy rule (same pw, fewer sets)")
+    ap.add_argument("--reverse", action="store_true",
+                    help="print the ordering reversed (frontier-DP / Kinnersley convention)")
     ap.add_argument("--no-order", action="store_true")
     ap.add_argument("--stats", action="store_true")
     a = ap.parse_args(argv)
@@ -44,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{name}\tn={g.n}\tpw<={a.alg1}: {'YES' if ans else 'NO'}"
                   f"\t{time.perf_counter() - t0:.3f}s")
             continue
-        r = pathwidth(g, upper=a.upper, want_order=not a.no_order)
+        r = pathwidth(g, upper=a.upper, want_order=not a.no_order, greedy2=a.greedy2)
         dt = time.perf_counter() - t0
         if r.width is None:
             print(f"{name}\tn={g.n}\tpw > {a.upper}\t{dt:.3f}s")
@@ -53,7 +57,8 @@ def main(argv: list[str] | None = None) -> int:
             if r.order is not None:
                 w = ordering_width(g, r.order)
                 assert w == r.width, (w, r.width)       # independent check
-                print("order:", " ".join(map(str, r.order)))
+                shown = r.order[::-1] if a.reverse else r.order
+                print("order:", " ".join(map(str, shown)))
         if a.stats:
             print(f"  sets={r.sets_expanded} pairs={r.pairs_popped} rescans={r.rescans}"
                   f" per_level={r.per_level}", file=sys.stderr)
