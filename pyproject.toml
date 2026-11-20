@@ -1,13 +1,14 @@
 [project]
 name = "kobayashi-pw"
 version = "0.1.0"
-description = "Exact pathwidth / vertex separation via Kobayashi's relevant-set DP, bottleneck (bucketed) search with ordering extraction"
+description = "Exact pathwidth / vertex separation via Kobayashi's relevant-set DP, one-pass bottleneck search, optimal orderings, and exact secondary-cost optimisation over all relevant optimal orderings"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]
 kobayashi-pw = "kobayashi_pw.cli:main"
+kobayashi-pw-orders = "kobayashi_pw.orders_cli:main"
 
 [dependency-groups]
 dev = [
