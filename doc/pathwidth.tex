@@ -1,0 +1,1466 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+\usepackage{booktabs}
+\usepackage{placeins}
+\usepackage[hidelinks]{hyperref}
+\usepackage[capitalise,nameinlink]{cleveref}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{proposition}[theorem]{Proposition}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+\newtheorem{example}[theorem]{Example}
+
+\newcommand{\Nm}{N^{-}}
+\newcommand{\vs}{\operatorname{vs}}
+\newcommand{\pw}{\operatorname{pw}}
+\newcommand{\Rel}{\mathcal{R}}
+\newcommand{\Gr}{\mathcal{G}}
+\newcommand{\cost}{w}
+\newcommand{\bott}{b}
+\newcommand{\set}[1]{\{#1\}}
+
+\title{One-pass bottleneck search for linear width parameters:\\
+exact pathwidth and cutwidth, optimal orderings,\\
+and secondary costs}
+\author{Victor Miller\\ {\small IDA Center for Communications Research}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Kobayashi~\cite{Kob15} gave a very simple dynamic program that decides
+whether a directed (or undirected) graph $D$ has pathwidth at most $k$ in
+time $3^{\tau(D)} n^{O(1)}$. Here $\tau(D)$ is the vertex cover number of the
+underlying undirected graph. The dynamic program runs over \emph{relevant}
+vertex sets, which are sets closed under a natural ``subsumption''
+expansion. Used as a decision procedure, the algorithm must be called
+repeatedly to find the pathwidth. Each call with $k$ above the true value is
+expensive, because the number of $k$-feasible relevant sets grows quickly
+with $k$.
+
+We observe that the cost of a step of Kobayashi's dynamic program does not
+depend on $k$. As a result, the vertex separation number is the value of a
+minimum-bottleneck path in a directed acyclic graph on relevant sets. A
+bucketed Dijkstra-type search computes it in a single pass. That pass
+discovers only relevant sets of bottleneck at most $\pw(D)$, so it never
+does more work than one call of the decision procedure at $k=\pw(D)$, and in
+practice it does considerably less. The same search, with one parent pointer
+per set, yields an explicit vertex ordering of width $\pw(D)$. We prove this,
+and we point out a subtlety: within one expansion step the vertices must be
+emitted in the order in which the expansion subsumes them. We describe the
+data structures of Python and C implementations and report timings.
+
+Two further results concern the use of the search. First, a greedy rule from
+the branch-and-bound algorithm of Coudert, Mazauric and Nisse can be added to
+the expansion; this leaves every guarantee intact and reduces the number of
+sets 2--6 times. Second, when the last level is completed, the relevant sets
+form a DAG whose paths are pathwidth-optimal orderings: about $10^{26}$ of
+them for the square-sum graph on $\{1,\dots,57\}$. Any secondary cost that
+is local to a step can be minimised over all of these exactly, including
+costs with a multiplicative carry such as those used to tune frontier
+dynamic programs. On our test graphs the C implementation is about 6--20
+times faster than the Cython branch and bound in Sage; that implementation
+exceeded 120\,s on four instances with its default limit on stored prefixes.
+
+Finally, we ask which of these ideas apply to other width parameters. Both
+greedy rules used for pathwidth are instances of one lemma: for a
+submodular prefix cost, a vertex whose addition does not increase the cost
+can be added at once. For vertex separation, the two rules together are
+exactly the non-increasing additions. The lemma also applies to cutwidth.
+Combined with the vertex-cover normal form of Cygan, Lokshtanov, Pilipczuk,
+Pilipczuk and Saurabh, the same one-pass search computes cutwidth exactly
+over at most $2^{\tau}$ states, and in a Python prototype it gives the
+cutwidth of the square-sum graph on $\{1,\dots,60\}$. For treewidth, the
+search applies to elimination orderings but its greedy rules are weak.
+Bandwidth does not fit the framework, because its cost depends on positions
+and not on prefix sets.
+\end{abstract}
+
+\section{Introduction}
+
+Let $D=(V,A)$ be a directed graph with $n=|V|$ vertices. For $X\subseteq V$
+write $\Nm(X)=\bigl(\bigcup_{x\in X}\Nm(x)\bigr)\setminus X$, where $\Nm(x)$
+is the set of in-neighbours of~$x$. A linear ordering $\sigma=(v_1,\dots,v_n)$
+of $V$ has \emph{width}
+\[
+  \cost(\sigma)=\max_{1\le i\le n}\bigl|\Nm(\set{v_1,\dots,v_i})\bigr|,
+\]
+and the \emph{vertex separation number} $\vs(D)$ is the minimum width over
+all orderings. By Yang and Cao~\cite{YC08}, $\vs(D)$ equals the directed
+pathwidth $\pw(D)$. For an undirected graph $G$, replace each edge by a pair
+of antiparallel arcs; then $\Nm$ is the ordinary open neighbourhood, and
+$\vs(G)=\pw(G)$ by Kinnersley~\cite{Kin92}. Everything below applies to both
+cases, and we write $N(\cdot)$ for $\Nm(\cdot)$ when no confusion is possible.
+
+Computing pathwidth is NP-hard~\cite{KF79}. Exact methods fall roughly into
+three families.
+
+\emph{Mathematical programming.} Coudert~\cite{Cou16} gave compact integer
+linear programming formulations for several linear ordering problems,
+pathwidth among them. His variables record whether a vertex belongs to a
+prefix of the ordering, rather than its exact position. An implementation
+accompanies the paper~\cite{CouCode}. Mallach~\cite{Mal18} studied
+formulations based on linear-ordering variables. The present author
+rewrote Coudert's vertex separation model as a MaxSAT instance
+(\cref{sec:maxsat}). On the author's test graphs, the MaxSAT version was frequently hundreds of times
+faster than the MIP solved with Gurobi~\cite{Gurobi}.
+
+\emph{Branch and bound.} Coudert, Mazauric and Nisse~\cite{CMN14} explore
+layouts depth first. They combine three devices: reduction rules that
+contract parts of the graph, greedy steps that extend a prefix without loss
+(their Lemma~6), and a table of prefix \emph{sets} already explored (their
+Lemma~7). Their implementation is part of Sage~\cite{Sage}. Two of these
+devices reappear below. The first case of their greedy step is exactly
+Kobayashi's subsumption, with arcs reversed, and their second case can be
+added to the expansion of \cref{sec:alg} (\cref{sec:greedy2}). Their prefix
+table is a memo on the same states as the set dynamic program.
+
+\emph{Dynamic programming over vertex sets.} The classical recurrence of
+Bodlaender et al.~\cite{BFKKT12} runs over all $2^n$ prefix sets. Pruning
+tricks reduce this substantially~\cite{SV09,KKKTT12,Tam11}. In particular,
+Kobayashi~\cite{Kob15} showed that one may restrict the dynamic program to
+\emph{relevant} sets, of which there are at most $3^{\tau(D)}$. This gives
+the $3^{\tau(D)}n^{O(1)}$ bound of Chapelle et al.~\cite{CLTV13}, but with a
+much simpler algorithm, and one that extends to digraphs.
+
+Kobayashi's Algorithm~1 is a decision procedure: given $k$, it answers
+whether $\vs(D)\le k$. Two practical issues arise in using it.
+
+\begin{enumerate}
+\item \textbf{Locating the optimum.} Binary search over $k$ works, but every
+probe with $k>\pw(D)$ is expensive: fewer sets are pruned, and the number
+$|\Rel_k|$ of relevant sets reachable under bound $k$ grows rapidly with $k$
+(\cref{tab:overshoot}). Probes below $\pw(D)$ are wasted work as well.
+\item \textbf{Producing a witness.} The decision procedure does not output an
+ordering of width $\pw(D)$.
+\end{enumerate}
+
+\paragraph{Other widths.} The approach solved these problems for pathwidth
+far faster than the mathematical programming models, so it is natural to
+ask which other width parameters it fits. Cutwidth, treewidth and
+bandwidth are the classical candidates. Cutwidth parameterized by the
+vertex cover number is already known to be solvable in $2^{\tau}n^{O(1)}$
+time~\cite{CLPPS14}, by an argument closely related to the greedy rules
+used here. For treewidth, the most effective exact solvers use
+positive-instance driven dynamic programming over minimal separators and
+potential maximal cliques~\cite{Tam19}.
+
+\paragraph{Contributions.}
+\begin{itemize}
+\item We show that the cost of each transition of Kobayashi's dynamic
+program is independent of $k$ (\cref{lem:mono}). Consequently $\vs(D)$ is a
+minimum-bottleneck path value in a DAG on relevant sets (\cref{thm:bott}).
+\item We give a one-pass, bucketed bottleneck search
+(\cref{alg:bucket}). It computes $\vs(D)$ without any width parameter. It
+discovers every relevant set of bottleneck $<\pw(D)$, and only some of those
+of bottleneck exactly $\pw(D)$. So its work lies between that of
+Algorithm~1 at $k=\pw(D)-1$ and at $k=\pw(D)$ (\cref{thm:work}). It retains
+the $3^{\tau(D)}n^{O(1)}$ bound.
+\item We show how to recover an optimal ordering from parent pointers
+(\cref{thm:order}), and we identify the necessary ordering constraint inside
+an expansion step (\cref{ex:order}).
+\item We show that the second greedy rule of~\cite{CMN14} can be added to
+the expansion without affecting any of these guarantees
+(\cref{sec:greedy2}).
+\item Completing the last level of the search yields a DAG whose paths are
+pathwidth-optimal orderings. We show how to minimise any step-local secondary
+cost over all of them exactly, including costs with a multiplicative carry
+(\cref{sec:orders}).
+\item We describe compact data structures (\cref{sec:ds}) and report
+timings for Python and C implementations, together with comparisons against
+a MaxSAT model and the branch and bound of~\cite{CMN14} (\cref{sec:exp}).
+\item We prove a greedy lemma for any submodular prefix cost
+(\cref{lem:submod}). For vertex separation, its hypothesis is exactly the
+union of Kobayashi's subsumption and the second rule of~\cite{CMN14}
+(\cref{prop:vsrules}).
+\item Using the lemma and the normal form of~\cite{CLPPS14}, the one-pass
+search computes cutwidth exactly over at most $2^{\tau}$ states
+(\cref{sec:cutwidth}). We also explain why treewidth gains little and
+bandwidth does not fit (\cref{sec:twbw}).
+\end{itemize}
+
+\section{Kobayashi's algorithm}\label{sec:kob}
+
+We recall the definitions of~\cite{Kob15}. A sequence $\sigma$ of distinct
+vertices is \emph{$k$-feasible} if every prefix $\sigma_i$ satisfies
+$|N(V(\sigma_i))|\le k$. A set $U\subseteq V$ is $k$-feasible if
+$U=V(\sigma)$ for some $k$-feasible $\sigma$, and \emph{strongly
+$k$-feasible} if moreover $\sigma$ is a prefix of a $k$-feasible ordering of
+all of $V$. Thus $\vs(D)\le k$ if and only if $V$ is $k$-feasible.
+
+\begin{definition}
+Let $U\subseteq V$. A vertex $x\in V\setminus U$ is \emph{subsumed} by $U$
+if $\Nm(x)\subseteq U\cup N(U)$. The \emph{expansion} $U^{*}$ is obtained by
+repeatedly adding subsumed vertices to $U$ until none remain. $U$ is
+\emph{relevant} if $U^{*}=U$.
+\end{definition}
+
+\begin{lemma}[{\cite[Lemma~1]{Kob15}}]\label{lem:kob1}
+If $U$ is $k$-feasible (resp.\ strongly $k$-feasible), so is $U^*$.
+\end{lemma}
+
+\begin{algorithm}[t]
+\caption{Kobayashi's decision procedure~\cite[Algorithm~1]{Kob15}.}\label{alg:kob}
+\begin{algorithmic}[1]
+\For{$i=0,\dots,n$} $R_i\gets\emptyset$ \EndFor
+\State add $\emptyset^{*}$ to $R_{|\emptyset^{*}|}$
+\For{$i=0,\dots,n-1$}
+  \ForAll{$U\in R_i$}
+    \ForAll{$v\in V\setminus U$ with $|N(U\cup\set{v})|\le k$}
+      \State add $(U\cup\set v)^{*}$ to $R_{|(U\cup\set v)^*|}$
+    \EndFor
+  \EndFor
+\EndFor
+\State \Return ``yes'' if $R_n\ne\emptyset$, else ``no''
+\end{algorithmic}
+\end{algorithm}
+
+\begin{remark}
+In the published pseudocode, line~2 reads ``$R_i\gets\{\emptyset\}$''.
+This must mean $R_i\gets\emptyset$, the empty collection: read literally,
+$R_n$ would always be nonempty.
+\end{remark}
+
+Kobayashi proves that \cref{alg:kob} is correct~\cite[Lemma~2]{Kob15}. He
+also proves that there is an injection from relevant sets into ordered
+tripartitions of a minimum vertex cover~\cite[Lemma~3]{Kob15}. Hence at most
+$3^{\tau(D)}$ sets are ever stored.
+
+\section{The cost of a step is independent of \texorpdfstring{$k$}{k}}\label{sec:mono}
+
+\begin{lemma}\label{lem:mono}
+If $x\in V\setminus U$ is subsumed by $U$, then $N(U\cup\set x)\subseteq N(U)$.
+\end{lemma}
+\begin{proof}
+$N(U\cup\set x)=\bigl(N(U)\cup \Nm(x)\bigr)\setminus(U\cup\set x)$. Since
+$\Nm(x)\subseteq U\cup N(U)$, we have
+$\Nm(x)\setminus(U\cup\set x)\subseteq N(U)$.
+\end{proof}
+
+This is the observation at the start of the proof of~\cite[Lemma~1]{Kob15};
+the point is that it involves no $k$. Iterating it gives the following.
+
+\begin{corollary}\label{cor:exp}
+Let $T\subseteq V$, and let $x_1,\dots,x_m$ be the vertices of
+$T^*\setminus T$ in the order an expansion procedure adds them. That is,
+each $x_j$ is subsumed by $T_{j-1}=T\cup\set{x_1,\dots,x_{j-1}}$. Then
+$N(T_j)\subseteq N(T)$ for all $0\le j\le m$. In particular
+$|N(T_j)|\le|N(T)|$.
+\end{corollary}
+
+\begin{definition}[Relevant-set DAG]
+Let $\Gr$ be the directed graph whose vertices are the relevant sets. For
+each relevant $U\ne V$ and each $x\in V\setminus U$, it has an arc
+$U\to(U\cup\set x)^*$ labelled $x$, with cost
+\[\cost(U,x)=|N(U\cup\set x)|.\]
+Every arc strictly enlarges the set, so $\Gr$ is acyclic. The cost of a path
+is the maximum cost of its arcs; the empty path has cost $0$. For a relevant
+set $S$, let $\bott(S)$ be the minimum cost of a path from $\emptyset^*$ to
+$S$, or $\infty$ if there is none.
+\end{definition}
+
+\begin{definition}[Ordering of a path]\label{def:pathorder}
+Let $P=(S_0\xrightarrow{x_1}S_1\to\dots\xrightarrow{x_m}S_m)$ be a path in
+$\Gr$ with $S_0=\emptyset^*$. Its \emph{ordering} $\sigma(P)$ is the
+concatenation of the following segments:
+\begin{itemize}
+\item the vertices of $\emptyset^*$, in the order the expansion procedure
+adds them;
+\item for each $i=1,\dots,m$, the vertex $x_i$, followed by the vertices of
+$S_i\setminus(S_{i-1}\cup\set{x_i})$ in the order the expansion procedure,
+started from $S_{i-1}\cup\set{x_i}$, adds them.
+\end{itemize}
+\end{definition}
+
+\begin{lemma}\label{lem:pathwidth}
+$\sigma(P)$ is a sequence of distinct vertices with $V(\sigma(P))=S_m$, and
+every prefix $\pi$ of it satisfies
+$|N(V(\pi))|\le\max_i\cost(S_{i-1},x_i)$. Equality holds for the prefix
+ending at $x_i$, where $i$ attains the maximum.
+\end{lemma}
+\begin{proof}
+First, prefixes inside the first segment: by \cref{cor:exp} with
+$T=\emptyset$, they have empty boundary. Next, consider a prefix ending
+within segment $i$. Either it equals $S_{i-1}\cup\set{x_i}$, whose boundary
+has size exactly $\cost(S_{i-1},x_i)$, or it is $T_j$ for
+$T=S_{i-1}\cup\set{x_i}$ in the notation of \cref{cor:exp}, whose boundary
+is contained in $N(T)$.
+\end{proof}
+
+\begin{theorem}\label{thm:bott}
+$\bott(V)=\vs(D)$.
+\end{theorem}
+\begin{proof}
+$(\ge)$: if $\bott(V)<\infty$, a path of cost $\bott(V)$ yields, by
+\cref{lem:pathwidth}, an ordering of $V$ of width $\bott(V)$.
+
+$(\le)$: let $k=\vs(D)$, so $V$ is $k$-feasible. The proof
+of~\cite[Lemma~2]{Kob15} gives the following. Start from
+$\emptyset^*$, which is strongly $k$-feasible by \cref{lem:kob1}. From a
+strongly $k$-feasible relevant $U\ne V$ there is $v$ with $U\cup\set v$
+strongly $k$-feasible; in particular $|N(U\cup\set v)|\le k$, the
+boundary of the last prefix. Then $(U\cup\set v)^*$ is again strongly
+$k$-feasible and relevant. Repeating this traces a path from $\emptyset^*$
+to $V$ in $\Gr$ with all costs $\le k$.
+\end{proof}
+
+\begin{remark}\label{rem:Rk}
+For each $k$, the collection $\Rel_k=\bigcup_i R_i$ that \cref{alg:kob}
+computes with bound $k$ is exactly $\set{S:\bott(S)\le k}$. Indeed,
+\cref{alg:kob} processes sets in order of size, and arcs strictly increase
+size, so induction on $|S|$ applies. In particular
+$\Rel_0\subseteq\Rel_1\subseteq\cdots$.
+\end{remark}
+
+Two cheap consequences are already useful if one keeps the decision
+procedure.
+
+\begin{proposition}\label{prop:next}
+Suppose \cref{alg:kob} with bound $k$ answers ``no''. Let
+$k'=\min\set{\cost(U,x): U\in\Rel_k,\ \cost(U,x)>k}$, the smallest cost
+rejected at line~5. Then $\Rel_j=\Rel_k$ for $k\le j<k'$, and so
+$\vs(D)\ge k'$.
+\end{proposition}
+\begin{proof}
+For $j$ in this range no new arc becomes admissible, so $\Rel_j=\Rel_k$
+by \cref{rem:Rk}. Since $V\notin\Rel_k$, we get $\vs(D)=\bott(V)>j$ for
+every such $j$.
+\end{proof}
+
+\begin{proposition}\label{prop:loose}
+Run \cref{alg:kob} with any $k\ge\vs(D)$. Whenever $(U\cup\set v)^*=S$ is
+generated, update
+$f(S)\gets\min\bigl(f(S),\max(f(U),\cost(U,v))\bigr)$, with
+$f(\emptyset^*)=0$. Then $f(V)=\vs(D)$ at the end.
+\end{proposition}
+\begin{proof}
+All predecessors of $S$ are strictly smaller, so they are final when $S$'s
+size class is processed. Hence $f(S)=\bott(S)$ for every $S\in\Rel_k$.
+Moreover $\Rel_k$ contains every set on an optimal path to $V$, since those
+sets have $\bott\le\vs(D)\le k$. Finally apply \cref{thm:bott}.
+\end{proof}
+
+\Cref{prop:loose} gives the exact value from a single overestimate, but it
+pays the full cost $|\Rel_k|$. The next section avoids that cost.
+
+\section{A one-pass bucketed bottleneck search}\label{sec:alg}
+
+Path cost in $\Gr$ is a maximum, so it is monotone along paths. A
+Dijkstra-type search~\cite{Dij59} therefore applies to the
+minimum-bottleneck (``maximum capacity'') path problem~\cite{Pol60}. The
+costs are integers in $[0,n-1]$, so a priority queue is unnecessary: we
+process levels $c=0,1,2,\dots$ in order.
+
+\begin{algorithm}[t]
+\caption{One-pass bottleneck search with parent pointers.}\label{alg:bucket}
+\begin{algorithmic}[1]
+\State $S_0\gets\emptyset^*$; \ $\mathit{par}[S_0]\gets\bot$; \ $c\gets 0$
+\State $B_0,\dots,B_n\gets\emptyset$ \Comment{level buckets of discovered sets}
+\State $W\gets\emptyset$ \Comment{work stack of pairs $(S,x)$ for the current level}
+\Statex
+\Procedure{Scan}{$S,\ell,c$}\Comment{release arcs of cost in $(\ell,c]$; reschedule $S$}
+  \State $c'\gets\infty$
+  \ForAll{$x\in V\setminus S$}
+    \State $w\gets|N(S\cup\set x)|$
+    \If{$\ell<w\le c$} push $(S,x)$ on $W$
+    \ElsIf{$w>c$} $c'\gets\min(c',w)$ \EndIf
+  \EndFor
+  \If{$c'<\infty$} append $S$ to $B_{c'}$ \EndIf
+\EndProcedure
+\Statex
+\If{$S_0=V$} \Return $(0,\ \text{expansion order of }\emptyset)$ \EndIf
+\State \Call{Scan}{$S_0,-1,0$}
+\Loop
+  \While{$W\neq\emptyset$}
+    \State pop $(P,x)$ from $W$; \ $T\gets(P\cup\set x)^*$
+    \If{$T\in\mathrm{dom}(\mathit{par})$} \textbf{continue} \EndIf
+    \State $\mathit{par}[T]\gets(P,x)$
+    \If{$T=V$} \Return $(c,\ \textsc{Extract}(\mathit{par}))$ \EndIf
+    \State \Call{Scan}{$T,-1,c$}
+  \EndWhile
+  \State $c\gets c+1$
+  \ForAll{$S\in B_c$} \Call{Scan}{$S,c-1,c$} \EndFor
+\EndLoop
+\end{algorithmic}
+\end{algorithm}
+
+Every set discovered at some level is placed in exactly one bucket, namely
+that of its cheapest not-yet-released outgoing arc. When the search reaches
+that level, the set is rescanned, the arcs of exactly that cost are released,
+and the set is rescheduled. Consequently each arc $(S,x)$ is pushed onto
+$W$ exactly once, at level $\max(c_S,\cost(S,x))$, where $c_S$ is the level
+at which $S$ was discovered.
+
+\begin{theorem}[Correctness]\label{thm:correct}
+\Cref{alg:bucket} discovers every relevant set $S$ with $\bott(S)<\vs(D)$,
+and each set it discovers at level $c$ satisfies $\bott(S)=c$. It returns
+$c=\vs(D)$.
+\end{theorem}
+\begin{proof}
+We prove by induction on $c$ the following claim: when level $c$ ends (that
+is, $W$ is empty and the search is about to move to $c+1$), every $S$ with
+$\bott(S)\le c$ has been discovered, and every set discovered so far has
+$\bott$ equal to its discovery level.
+
+\emph{Discovery levels are correct.} Suppose $T$ is discovered at level $c$
+via a pair $(P,x)$. That pair was pushed at level
+$\max(c_P,\cost(P,x))\le c$. By induction $\bott(P)=c_P$, so
+$\bott(T)\le c$. On the other hand, $T$ was not discovered by the end of
+level $c-1$, so by the induction hypothesis $\bott(T)>c-1$. Hence
+$\bott(T)=c$.
+
+\emph{Completeness.} Let $\bott(S)\le c$, and take a path of cost $\le c$
+from $S_0$ to $S$. Every set on it has $\bott\le c$. Induct along the
+path. If a set $S'$ on it has been discovered, at level $c_{S'}\le c$, then
+the next arc $(S',x)$ has cost $\le c$, so it is pushed by the end of
+level $c$: at discovery if $\cost\le c_{S'}$, or at the rescan of level
+$\cost(S',x)$ otherwise, since $S'$ is rescheduled at each successive
+larger cost. The level-$c$ loop runs until $W$ is empty, so the head of the
+arc is discovered during level $c$ or earlier.
+
+The first time $V$ is discovered, at level $c$, we therefore have
+$c=\bott(V)=\vs(D)$ by \cref{thm:bott}. Termination is clear, because
+$\bott(V)\le n-1$.
+\end{proof}
+
+\begin{theorem}[Optimal ordering]\label{thm:order}
+Chase the parent pointers from $V$ back to $\emptyset^*$. This gives a path
+$P$ in $\Gr$ of cost exactly $\vs(D)$, and $\sigma(P)$ from
+\cref{def:pathorder} is an ordering of $V$ of width $\vs(D)$.
+\end{theorem}
+\begin{proof}
+If $\mathit{par}[T]=(P,x)$, then $(P,x)$ was pushed at a level $\le c_T$,
+so $\cost(P,x)\le c_T$, and $P$ was discovered at level $c_P\le c_T$. By
+induction, the path of parent pointers to any $T$ has cost $\le c_T$. For
+$T=V$ this is $\le\vs(D)$. \Cref{lem:pathwidth} gives an ordering of that
+width, and \cref{thm:bott} gives the reverse inequality.
+\end{proof}
+
+The proof shows that \emph{any} recorded parent is acceptable: each arc
+popped at level $c$ has cost $\le c$, and its tail was discovered at a level
+$\le c$. Hence the first parent found is optimal, and no comparison between
+parents is ever needed. (In the setting of \cref{prop:loose}, by contrast,
+one must keep the parent that attains the minimum of $f$.)
+
+\begin{example}[Order within an expansion matters]\label{ex:order}
+In \cref{def:pathorder} the expansion vertices of a step cannot be emitted
+in arbitrary order. Consider an undirected graph with vertices
+$a,b,x,w_1,w_2,w_3$ and edges $ab$, $ax$, and $w_ib$, $w_ix$ for $i=1,2,3$.
+Take $T=\set a$, so $N(T)=\set{b,x}$. Each $w_i$ is subsumed by $T$, since
+$N(w_i)=\set{b,x}\subseteq T\cup N(T)$. The vertex $x$ is not, since
+$N(x)=\set{a,w_1,w_2,w_3}$. Once the $w_i$ have been added, $x$ (and $b$)
+become subsumed. If $x$ were placed immediately after $a$, the prefix
+$\set{a,x}$ would have boundary $\set{b,w_1,w_2,w_3}$ of size $4>2=|N(T)|$.
+Emitting vertices in the order the expansion adds them, one at a time with
+each subsumed by the current set, avoids this. Kobayashi's own definition
+adds vertices in rounds; any order within a round is fine, but the order of
+the rounds must be kept.
+\end{example}
+
+\begin{theorem}[Work]\label{thm:work}
+Let $\mathcal{D}$ be the family of sets discovered by \cref{alg:bucket}.
+Then
+\[
+  \Rel_{\vs(D)-1}\ \subseteq\ \mathcal{D}\ \subseteq\ \Rel_{\vs(D)},
+\]
+where $\Rel_{-1}=\emptyset$. Each $S\in\mathcal{D}$ is scanned at most $n$
+times, and each arc is pushed at most once. Hence the running time is
+$O(|\Rel_{\vs(D)}|\cdot n^{O(1)})=3^{\tau(D)}n^{O(1)}$.
+\end{theorem}
+\begin{proof}
+The inclusions follow from \cref{thm:correct,rem:Rk}. A set is rescanned
+only at levels equal to distinct costs of its outgoing arcs, of which there
+are at most $n$. The bound $|\Rel_k|\le 3^{\tau(D)}$ is~\cite[Lemma~3]{Kob15}.
+\end{proof}
+
+\paragraph{Comparison with search over $k$.}
+By \cref{thm:work}, the one-pass search costs at most one run of
+\cref{alg:kob} at the optimal $k$. Binary search over
+$k\in[\ell,u]$ costs $\sum_{\text{probes}}|\Rel_{k}|$, and that sum is
+dominated by its largest probe, which in general exceeds $\vs(D)$. Even
+linear search upward from a lower bound costs
+$\sum_{k=\ell}^{\vs(D)}|\Rel_k|$ and repeats all the work below the optimum
+at every probe. In our experiments $\mathcal{D}$ is close to the lower end
+of the sandwich (\cref{tab:sandwich}). The reason is that $W$ is a LIFO
+stack: at level $\vs(D)$ the search proceeds depth-first and usually reaches
+$V$ after discovering only a small fraction of
+$\Rel_{\vs(D)}\setminus\Rel_{\vs(D)-1}$.
+
+\paragraph{Decision version.}
+To decide $\vs(D)\le k$, stop when $c$ would exceed $k$. By
+\cref{thm:work}, this explores a subset of $\Rel_k$, and it returns early
+with a witness ordering when $\vs(D)\le k$.
+
+\subsection{A stronger expansion}\label{sec:greedy2}
+
+Coudert, Mazauric and Nisse~\cite[Lemma~6]{CMN14} prove that a prefix can be
+extended greedily, without loss, by a vertex $v$ that satisfies either of
+two conditions. They state the lemma for the out-neighbour convention;
+applied to the reversed digraph it reads as follows in ours.
+
+\begin{lemma}[{\cite[Lemma~6]{CMN14}}]\label{lem:cmn6}
+Let $U\subsetneq V$ and $v\in V\setminus U$. Suppose that either
+\textup{(i)} $\Nm(v)\subseteq U\cup N(U)$, or \textup{(ii)} $v\in N(U)$ and
+$|\Nm(v)\setminus(U\cup N(U))|=1$. If $U$ is strongly $k$-feasible, so is
+$U\cup\set v$.
+\end{lemma}
+
+Condition~(i) is subsumption. Under~(ii), with $w$ the unique in-neighbour
+of $v$ outside $U\cup N(U)$, we have $N(U\cup\set v)=(N(U)\setminus\set
+v)\cup\set w$, so the boundary keeps its size. Define $U^{**}$ by adding
+vertices one at a time, each satisfying~(i) or~(ii) with respect to the
+current set, by a fixed deterministic rule, until neither applies.
+
+\begin{proposition}\label{prop:greedy2}
+All results of \cref{sec:mono,sec:alg} remain true when $U^*$ is replaced by
+$U^{**}$ throughout, with the family $\Rel_k$ of \cref{rem:Rk} replaced by
+the sets generated under $U^{**}$. In particular \cref{alg:bucket} still
+returns $\vs(D)$ together with an ordering of that width, and every set it
+stores is relevant, so the bound $3^{\tau(D)}n^{O(1)}$ still holds.
+\end{proposition}
+\begin{proof}
+\Cref{cor:exp} is replaced by the remark that each vertex added under~(i)
+or~(ii) leaves the boundary size unchanged or makes the boundary smaller.
+Hence every prefix inside a step has boundary size at most $\cost(U,x)$,
+and \cref{lem:pathwidth} holds. In the proof of \cref{thm:bott}, the
+appeal to \cref{lem:kob1} is replaced by \cref{lem:kob1,lem:cmn6}. The
+proofs of \cref{thm:correct,thm:order,thm:work} use only these two facts,
+together with the determinism of the expansion. Finally, $U^{**}$ is closed
+under~(i), so it is relevant.
+\end{proof}
+
+Conditions (i) and (ii) together say exactly that adding $v$ does not
+increase $|N(U)|$ (\cref{prop:vsrules}). \Cref{lem:cmn6} is therefore a
+special case of the general greedy lemma of \cref{sec:submod}.
+
+$U^{**}$ may depend on the order in which the rules are applied: (ii) is
+not monotone. The arguments need only a fixed procedure. On our test graphs
+the stronger expansion reduces the number of stored sets 2--6 times
+(\cref{tab:bab}). It does reduce the family of orderings in
+\cref{sec:orders} much more sharply, so there we use $U^*$.
+
+\section{All relevant optimal orderings, and secondary costs}\label{sec:orders}
+
+A dynamic program that is driven by a vertex ordering, such as a
+frontier dynamic program for counting Hamiltonian paths, often depends on
+far more than the width. Many orderings attain $\pw(D)$, and their running
+times can differ by an order of magnitude. This section shows that the
+search already contains a compact representation of a large family of
+optimal orderings, and that step-local secondary costs can be minimised
+exactly over that family.
+
+\begin{definition}\label{def:gamma}
+Let $k=\vs(D)$. The \emph{complete DAG} $\Gamma$ has as nodes $V$ and the
+relevant sets $S$ with $\bott(S)\le k$ from which $V$ can be reached by arcs
+of cost $\le k$; its arcs are the arcs of $\Gr$ of cost $\le k$ between
+nodes.
+\end{definition}
+
+\begin{proposition}\label{prop:gamma}
+The map $P\mapsto\sigma(P)$ of \cref{def:pathorder} is injective on paths
+of $\Gamma$ from $\emptyset^*$ to $V$, and every $\sigma(P)$ has width
+exactly $\vs(D)$. $\Gamma$ is obtained from \cref{alg:bucket} by continuing
+level $c=\vs(D)$ until $W$ is empty, instead of stopping at $V$, and then
+making one backward pass over the stored sets in order of decreasing size.
+\end{proposition}
+\begin{proof}
+By \cref{lem:pathwidth}, the width of $\sigma(P)$ is the largest arc cost
+on $P$, which is at most $k$, so it equals $k$. Two different paths first
+differ at a node $S$ by their arc label $x$, which is the next vertex of
+the ordering. The proof of \cref{thm:correct}, applied with $c=k$, shows
+that completing level $k$ discovers every relevant set of bottleneck at most
+$k$, that is, $\Rel_k$. The backward pass keeps the sets with an arc of cost
+$\le k$ into a kept set or into $V$; the arcs out of $S$ are recomputed
+from $S$ and need not be stored.
+\end{proof}
+
+The paths of $\Gamma$ do not give every optimal ordering: they are the
+orderings that take subsumed vertices eagerly. In the convention of a
+left-to-right frontier dynamic program, the description is cleaner. The
+frontier of a prefix $T$ is $F(T)=\set{u\in T:N(u)\not\subseteq T}$, and by
+\cref{lem:rev}, $\sigma$ has width $k$ exactly when $\tau=\sigma^R$ has
+$\max_i|F(T_i)|=k$. For an undirected graph, a set $S$ is relevant exactly
+when every vertex of $T=V\setminus S$ has a neighbour in $T\setminus F(T)$,
+that is, a neighbour that has already left the frontier. (Indeed, $x\in T$
+is subsumed by $S$ iff $N(x)\subseteq S\cup N(S)=(V\setminus T)\cup F(T)$.)
+So the orderings of $\Gamma$, read as frontier orderings, are those
+in which this holds at every block boundary.
+
+\paragraph{Step-local costs.}
+Fix the frontier direction. A step adds a vertex $v$ to a prefix $T$, and
+we call a cost \emph{step-local} if each step contributes through
+quantities that depend only on $(T,v)$. Examples are the new frontier size
+$|F(T\cup\set v)|$, the number of edges from $v$ to vertices still in the
+frontier, the number of frontier vertices eliminated, the number of edges
+inside the frontier, the component sizes of the subgraph it induces, and
+the step index $|T|$. We allow a multiplicative carry $p$, as in proxy
+models of the state count of a dynamic program. A step contributes a triple
+$(a,e,\kappa)$ of nonnegative reals that depends only on $(T,v)$, and acts
+by
+\[
+\text{cost}\gets\text{cost}+a+p\,e,\qquad p\gets\max(p\,e\,\kappa,\,1),
+\]
+starting from $p=1$. Additive costs are the case $e=0$.
+
+\begin{proposition}\label{prop:pareto}
+Let $J(T,p)$ be the least cost of completing the prefix $T$ from carry $p$.
+Then $J(T,\cdot)$ is nondecreasing. Consequently, a dynamic program over
+$\Gamma$, run in the frontier direction, that keeps at each node only the
+labels $(\text{cost},p)$ not dominated in both coordinates by another label
+there, returns the exact minimum over all orderings of $\Gamma$. For
+additive costs the front has a single label, and keeping the $k$ smallest
+costs per node gives the $k$ best orderings.
+\end{proposition}
+\begin{proof}
+$J(V,p)=0$, and
+$J(T,p)=\min_{v}\bigl[a+p\,e+J\bigl(T\cup\set v,\max(p\,e\,\kappa,1)\bigr)\bigr]$.
+By induction on $|V\setminus T|$, each term is nondecreasing in $p$
+($e,\kappa\ge0$), and hence so is the minimum. If $c'\le c$ and $p'\le p$,
+then $c'+J(T,p')\le c+J(T,p)$, so a dominated label is never needed. In
+$\Gamma$ a step is a block; its triples are applied in sequence, and the
+frontier direction traverses $\Gamma$ backwards, from $V$ (the empty
+frontier prefix) to $\emptyset^*$.
+\end{proof}
+
+The same dynamic program, run over all prefixes $T$ with every
+$|F(T_i)|\le k$ rather than over $\Gamma$, gives the minimum over
+\emph{all} optimal orderings. It is the reference against which we measure
+the restriction to $\Gamma$ (\cref{tab:gammaloss}); that family is much
+larger (\cref{sec:exp}).
+
+\section{Other width parameters}\label{sec:widths}
+
+\Cref{alg:bucket} uses only three properties of vertex separation.
+\begin{enumerate}
+\item \emph{Set-determined steps.} The cost $c(S,v)\ge0$ of placing $v$
+after a prefix set $S$ depends only on $S$ and $v$.
+\item \emph{A min--max objective.} The width of an ordering is the largest
+step cost along it.
+\item \emph{Greedy closure.} Some extensions of a prefix are safe whatever
+the width bound, and the cost of an arc is the largest step cost in its
+block.
+\end{enumerate}
+Under~(1) and~(2) the width is a minimum-bottleneck path value in the DAG of
+prefix sets. The proofs of \cref{thm:correct,thm:order} then apply verbatim,
+with arcs $S\to\mathrm{cl}(S\cup\set v)$ and arc cost the largest step cost
+in the block. (When the closure can raise that cost, as for treewidth below,
+the block must be computed when the arc is scanned.) They use only the monotonicity of a maximum along a path and
+the determinism of the closure $\mathrm{cl}$. Property~(3) is what makes the
+search small. The bound $3^{\tau}$ of \cref{thm:work} is specific to
+Kobayashi's closure. This section asks which width parameters have the
+three properties.
+
+\subsection{A greedy lemma for submodular prefix costs}\label{sec:submod}
+
+Call $f\colon 2^V\to\mathbb{R}$ a \emph{prefix cost} when $c(S,v)=f(S\cup\set
+v)$. Then the width of an ordering is $\max_i f(S_i)$ over its prefixes.
+Write $\Delta(S,v)=f(S\cup\set v)-f(S)$. Recall that $f$ is
+\emph{submodular} exactly when $\Delta(\cdot,v)$ is antitone:
+$\Delta(X,v)\ge\Delta(Y,v)$ for $X\subseteq Y\not\ni v$.
+
+\begin{lemma}\label{lem:submod}
+Let $f$ be a submodular prefix cost. Suppose $S$ is a prefix of an ordering
+of value $M$ (so $f(S)\le M$), and $v\notin S$ satisfies $\Delta(S,v)\le0$.
+Then $S\cup\set v$ is a prefix of an ordering of value at most~$M$.
+\end{lemma}
+\begin{proof}
+Let the ordering continue after $S$ with $a_1,\dots,a_m,v,\dots$, and move
+$v$ to the front of the continuation. With $A_j=\set{a_1,\dots,a_j}$, each
+new prefix $S\cup A_j\cup\set v$ ($0\le j\le m$) satisfies
+\[
+f(S\cup A_j\cup\set v)=f(S\cup A_j)+\Delta(S\cup A_j,v)\le
+f(S\cup A_j)+\Delta(S,v)\le f(S\cup A_j)\le M.
+\]
+Every other prefix is unchanged.
+\end{proof}
+
+For vertex separation, $f(S)=|\Nm(S)|$ is submodular. Indeed
+$S\cup\Nm(S)$ is a coverage function of $S$, so it is submodular, and $|S|$
+is modular.
+
+\begin{proposition}\label{prop:vsrules}
+For $f(S)=|\Nm(S)|$ and $v\notin U$, we have $\Delta(U,v)\le0$ exactly when
+condition~\textup{(i)} or~\textup{(ii)} of \cref{lem:cmn6} holds.
+Consequently the strong-feasibility half of Kobayashi's \cref{lem:kob1}
+and \cref{lem:cmn6} both follow from \cref{lem:submod}, applied one vertex at a time, and the closure $U^{**}$
+of \cref{sec:greedy2} consists exactly of the non-increasing additions.
+\end{proposition}
+\begin{proof}
+Write $w=|\Nm(v)\setminus(U\cup N(U))|$. Then $N(U\cup\set v)=(N(U)\setminus\set
+v)\cup(\Nm(v)\setminus(U\cup N(U)))$, so $\Delta(U,v)=w-[v\in N(U)]$. This
+is $\le0$ exactly when $w=0$, which is~(i), or when $v\in N(U)$ and $w=1$,
+which is~(ii).
+\end{proof}
+
+We checked \cref{prop:vsrules} by brute force on 73\,080 pairs $(U,v)$ from
+random graphs and digraphs. We also checked \cref{lem:submod} directly, for
+vertex separation and for cutwidth, on 200 random graphs and digraphs with
+$n\le9$.
+
+\begin{remark}
+The mirror image of \cref{lem:submod} is false. One might expect that a
+vertex placed while $\Delta>0$ can be delayed until $\Delta\le0$, but the
+prefix immediately before its new position is not dominated. On the path
+$2-1-0-3$ with $f$ the cut size, the optimal ordering $(2,1,0,3)$ has width
+$1$. Delaying $2$ until after $1$ creates the prefix $\set1$ of cut~$2$.
+Delaying is allowed only while $\Delta\ge0$ along the way~\cite{CLPPS14}.
+\end{remark}
+
+Other submodular prefix costs include the cut size (\cref{sec:cutwidth})
+and the cut-rank function $\rho(S)=\operatorname{rank}_{\mathrm{GF}(2)}A[S,V\setminus
+S]$. The latter defines linear rank-width, which we have not tested.
+
+\subsection{Cutwidth}\label{sec:cutwidth}
+
+The cutwidth $\mathrm{cw}(G)$ of an undirected graph is the minimum over
+orderings of $\max_i|E(S_i,V\setminus S_i)|$. The cut size $f(S)$ is
+submodular. Here $\Delta(S,v)=\deg v-2|N(v)\cap S|$, which is the
+\emph{rank} of~\cite{CLPPS14}, and the first part of their Lemma~1 is
+\cref{lem:submod} for this~$f$. So \cref{alg:bucket} applies with:
+\begin{itemize}
+\item arc cost $f(S\cup\set x)$;
+\item closure: repeatedly add any vertex of rank $\le0$, which never raises
+the cost of the arc.
+\end{itemize}
+
+\paragraph{Vertex-cover restriction.} Let $C$ be any vertex cover, and
+$I=V\setminus C$. Cygan et al.~\cite[Lemma~2]{CLPPS14} show that some
+optimal ordering places every vertex of $I$ at a rank of $0$ or $\pm1$, at
+a position determined by $S\cap C$. Odd-degree vertices of $I$ that are
+balanced, meaning rank $+1$ now and $-1$ once their next neighbour arrives,
+may go just before that neighbour, and only their number matters. We
+therefore choose arc labels only from~$C$. For $x\in C\setminus S$, let
+$Y(S,x)$ be the set of odd-degree vertices of $I\setminus S$ adjacent to
+$x$ that have rank $+1$ at~$S$. The arc first places $i$ of them, then $x$,
+then applies the closure, which absorbs the rest of $Y(S,x)$. Its cost is
+\[
+f(S)+\min_{0\le i\le|Y(S,x)|}\max\bigl(i,\ \Delta(S,x)-i\bigr),
+\]
+because the two cuts involved are $f(S)+i$ and $f(S)+\Delta(S,x)-i$.
+
+\begin{proposition}\label{prop:cw2tau}
+With the vertex-cover restriction, every stored set $S$ satisfies $S\cap
+I=\set{u\in I:\Delta(S\cap C,u)\le0}$. Hence at most $2^{|C|}$ sets are
+stored, and the search runs in $2^{|C|}n^{O(1)}$ time.
+\end{proposition}
+\begin{proof}[Sketch]
+A vertex $u\in I$ has all its neighbours in $C$, so its rank depends only
+on $S\cap C$, and it is antitone in $S\cap C$. Vertices of $I$ enter only
+through the closure, or as members of $Y(S,x)$, whose rank is $-1$ once $x$
+is placed. Once a vertex of $I$ has rank $\le0$ it keeps rank $\le0$, and
+the closure adds every vertex of rank $\le0$.
+\end{proof}
+
+This matches the bound of~\cite{CLPPS14}, whose dynamic program runs over
+pairs (subset of $C$, last vertex of $C$). Our version adds the closure on
+$C$ as well, and the one-pass search settles only states of bottleneck at
+most $\mathrm{cw}(G)$. We have not written out a full proof that the
+closure on $C$ is compatible with the normal form of~\cite{CLPPS14}. Instead
+we checked the whole procedure against a brute-force $2^n$ dynamic program:
+1\,520 runs on 560 random and bipartite graphs with $n\le13$, over up to
+three variants (no rules, closure only, closure plus cover), with no
+disagreement.
+A first attempt that delayed vertices of $I$ naively until rank
+$\le0$ (see the remark in \cref{sec:submod}) was one too high on 75 of 400
+graphs, which is how the subtlety was found.
+
+\Cref{tab:cw} reports a Python prototype on the square-sum graphs. The
+cover is a minimum vertex cover, found by simple branching. Every reported
+width is attained by an ordering that was re-checked, and is consistent with
+$\pw\le\mathrm{cw}$. For $n\ge45$ the optimality of the value rests on the
+argument above and the small-graph tests.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{rrrrrrrr}
+\toprule
+$n$ & $\tau$ & $\vs$ & $\mathrm{cw}$ & closure + cover & time (s) & closure only & no rules\\
+\midrule
+25 & 13 & 4 & 6 & 141 & 0.0 & 372 & 7\,871\\
+30 & 16 & 5 & 6 & 191 & 0.0 & 785 & 3\,589\\
+35 & 19 & 5 & 9 & 1\,292 & 0.2 & 6\,519 & 31\,306\\
+40 & 21 & 7 & 11 & 3\,465 & 0.7 & 29\,085 & 199\,503\\
+45 & 25 & 9 & 13 & 12\,065 & 2.8 & & \\
+50 & 29 & 9 & 14 & 22\,345 & 6.8 & & \\
+55 & 32 & 10 & 17 & 94\,068 & 37 & & \\
+57 & 33 & 11 & 20 & 393\,746 & 168 & & \\
+60 & 34 & 13 & 22 & 771\,807 & 359 & & \\
+\bottomrule
+\end{tabular}
+\caption{Exact cutwidth of the square-sum graphs $Q_n$ with the one-pass
+search (Python prototype, one core). The columns ``closure + cover'',
+``closure only'' and ``no rules'' give the number of settled states.
+$\tau$ is the vertex cover number. The stored states are far fewer than
+$2^{\tau}$, because the search never goes above the optimum.}\label{tab:cw}
+\end{table}
+
+The data structures of \cref{sec:ds} carry over directly to a C version:
+only the cost function, the rank closure and the cover-restricted arcs
+change.
+
+\subsection{Treewidth and bandwidth}\label{sec:twbw}
+
+\paragraph{Treewidth.} The treewidth is the minimum over elimination
+orderings of $\max_i|Q(S_{i-1},v_i)|$~\cite{BFKKT12}. Here $Q(S,v)$ is the
+set of vertices outside $S\cup\set v$ reachable from $v$ through~$S$. This
+cost is set-determined, so properties~(1) and~(2) hold and the one-pass
+search applies. Eliminating simplicial vertices of the current elimination
+graph is a safe closure: such a vertex has degree at most the treewidth of
+what remains. Unlike the closures above, it can raise the cost of its arc,
+so the arc cost is the maximum over the block. There is no submodular prefix
+function here, so \cref{lem:submod} does not apply. In our prototype (which
+agrees with brute force) the simplicial rule only reduced the settled states
+on $Q_{20}$ from 61\,963 to 20\,788. The elimination-ordering dynamic
+program is in any case far weaker than Tamaki's positive-instance driven
+dynamic program over minimal separators and potential maximal
+cliques~\cite{Tam19}. The ingredient that does transfer to that setting is
+replacing the outer loop over $k$ by a single bottleneck pass. Because
+positive-instance driven programs combine pairs of blocks, this needs
+Knuth's generalisation of Dijkstra's algorithm to superior
+functions~\cite{Knu77}. We expect a modest constant-factor gain, since the
+run at the optimal $k$ usually dominates, but have not measured it. A
+$3^{\tau}n^{O(1)}$ algorithm for treewidth is due to Chapelle et
+al.~\cite{CLTV13}.
+
+\paragraph{Bandwidth.} The bandwidth of an ordering is $\max_{uv\in
+E}|\operatorname{pos}u-\operatorname{pos}v|$. This depends on positions
+within the prefix, not only on the prefix set. Two prefixes with equal sets
+but different orders have different futures, because each placed vertex $u$
+forces its unplaced neighbours to land by position
+$\operatorname{pos}u+b$. The classical dynamic programs~\cite{Sax80,GS84}
+therefore keep the last $b$ placed vertices in order, so the state space
+itself depends on the bound $b$. Property~(1) fails, and so do the exchange
+arguments, because moving a vertex shifts every vertex it passes. What does
+transfer is a lower bound. An ordering of bandwidth $b$ has every prefix
+boundary of size at most $b$, so $\pw(G)\le\mathrm{bw}(G)$, and the
+pathwidth computed here can seed an incremental SAT or ILP
+search~\cite{BBNNPR13}. Exact exponential algorithms are also
+known~\cite{CP12}.
+
+\section{Data structures}\label{sec:ds}
+
+\paragraph{Bit sets.}
+Vertices are numbered $0,\dots,n-1$, and a vertex set is a bit mask. In C
+this is one \texttt{uint64\_t}, so $n\le 64$. In Python it is an arbitrary-precision
+\texttt{int}. The graph is stored as the array $\mathit{nin}[x]$ of
+in-neighbour masks; for an undirected graph these are the neighbourhood
+masks. Every discovered set $S$ is carried together with
+\[
+  \nu(S)=\bigcup_{u\in S}\mathit{nin}[u],
+\]
+so that $N(S)=\nu(S)\mathbin{\&}\lnot S$. Then the cost of a candidate arc
+is a constant number of word operations:
+\[
+  \cost(S,x)=\operatorname{popcount}\bigl((\nu(S)\mid\mathit{nin}[x])\mathbin{\&}\lnot(S\mid 2^x)\bigr),
+\]
+and $\nu(S\cup\set x)=\nu(S)\mid\mathit{nin}[x]$. We iterate over the
+members of $V\setminus S$ using count-trailing-zeros and clearing the lowest
+set bit.
+
+\paragraph{Expansion.}
+To compute $T^*$ we maintain the closed mask $C=T\mid\nu(T)$, which is
+$T\cup N(T)$. A vertex $x\notin T$ is subsumed exactly when
+$\mathit{nin}[x]\mathbin{\&}\lnot C=0$. We sweep $V\setminus T$, add every
+subsumed vertex immediately (updating $T$, $\nu$ and $C$), and repeat until a
+sweep adds nothing. This one-at-a-time procedure is exactly what
+\cref{cor:exp} requires. It is deterministic, so the same expansion order
+can be recomputed during extraction instead of being stored. Each sweep costs
+$O(n)$ word operations, and there are at most $|T^*\setminus T|+1$ sweeps.
+
+\paragraph{Visited table and parent pointers.}
+Discovered sets are kept in a hash table mapping $S\mapsto(P,x)$. In C this
+is open addressing with linear probing, a power-of-two capacity, load factor
+$\le 1/2$, and the 64-bit finaliser of MurmurHash3 as the mixing function.
+The key is stored as $S+1$, so that $0$ can mark an empty slot. This cannot
+overflow, because the full set $V$ is never inserted: its parent link is
+kept in a separate variable, since its discovery ends the search. A slot holds $S$, $P$ and $x$, which is 24 bytes with
+padding. In Python the table is a \texttt{dict}. We store neither $\nu(S)$
+nor the expansion order; both are recomputed in $O(n^2)$ word operations per
+step during extraction, which runs once.
+
+\paragraph{Pre-expansion test.}
+Before computing $(P\cup\set x)^*$ we look up $T_0=P\cup\set x$ itself. If
+$T_0$ is already in the table, it is relevant, so $T_0^*=T_0$ and it has
+been discovered. The expansion can then be skipped. This avoids the most
+expensive operation for a substantial fraction of popped pairs.
+
+\paragraph{Work stack and level buckets.}
+The work stack $W$ holds triples $(S,\nu(S),x)$. A naive bucketed Dijkstra
+would place every rejected arc $(S,x)$ in the bucket of its cost, costing up
+to $n$ entries per set. Instead, each discovered set appears in exactly one
+bucket at a time, as a pair $(S,\nu(S))$: the bucket of its cheapest arc not
+yet released (procedure \textsc{Scan}). When level $c$ is reached, $S$ is
+rescanned, and its arcs of cost exactly $c$ are released. This trades $O(n)$
+recomputation per rescan, which is cheap with bit-parallel cost evaluation,
+for an $n$-fold reduction in bucket memory. Within a level the processing
+order does not affect correctness (\cref{thm:correct}). LIFO order is used
+because it reaches $V$ quickly at the final level and gives good cache
+locality.
+
+\paragraph{Memory.}
+On the largest test graph (\cref{tab:time}), the C implementation's peak
+resident memory was about 390 bytes per discovered set, against about
+1.2\,KB per set for Python. The C figure includes the hash table at load
+$\le1/2$, the buckets, and the work stack. Since $|\mathcal{D}|$ can grow
+like $3^{\tau(D)}$, memory rather than time is usually the binding
+constraint.
+
+\paragraph{Larger graphs and further engineering.}
+A second C program, \texttt{kpw2}, implements four extensions, and
+\texttt{doc/kpw2\_design.md} in the code repository gives the details and
+measurements.
+\begin{enumerate}
+\item \emph{More than 64 vertices.} Sets are arrays of $W$ words, fixed at
+compile time, so $n\le64W$. Hash slots carry an explicit occupancy byte, so
+no key value is reserved.
+\item \emph{A restricted expansion sweep.} A vertex can become subsumed
+only when $U\cup N(U)$ gains one of its in-neighbours. Rule-1 expansion
+therefore runs as a worklist over the out-neighbours of the newly closed
+vertices. The closure is the least fixpoint of a monotone operator, so the
+sets, and all counts, are identical to those of the full sweep. On our
+graphs the full sweep took 14--18\% of the time, which bounds the possible
+saving.
+\item \emph{Compact parents.} With an option, a slot stores only the key,
+the arc label $x$ and $|P|$, which makes the table 40\% smaller. During
+extraction, a predecessor is recovered by one table scan per step. The scan
+looks for a stored $P\subseteq T\setminus\set x$ of the recorded size with
+$\cost(P,x)\le\vs(D)$ whose expansion with $x$ is $T$. Any such $P$ gives a
+valid optimal chain, and the recorded parent is one of them. We first tried
+undoing the expansion by peeling vertices. That search branched over every
+interior vertex and was abandoned.
+\item \emph{Threads.} By \cref{thm:correct}, the order of work within a
+level is irrelevant, so threads share each level. The hash table is
+sharded with spin locks, each thread drains its own stack depth first and
+steals half of another's when empty, and an atomic count of pending pairs
+ends the level.
+\end{enumerate}
+A further change cut memory substantially. The stack holds one item per
+set, carrying the mask of arc labels still to try, instead of one entry per
+label. Taking the highest label of the top item reproduces the order of
+\cref{alg:bucket} exactly. With one thread and $W=1$, \texttt{kpw2}
+matches \texttt{kpw} in time and uses about a third of its memory (for
+example, 57\,MB against 201\,MB on $Q_{63}$). With $W=2$ it costs about
+$1.5\times$ in time. Four threads gave speedups of 2--2.5 on a 4-core
+machine; the search is dominated by cache misses in the hash table. With
+\texttt{kpw2}, the square-sum graphs $Q_n$ for odd $n$ from 65 to 75 take under a
+second each with the stronger expansion. Their widths are
+$\vs(Q_n)=14$ for $n=65,67,\dots,73$ and $\vs(Q_{75})=15$, and
+$Q_{65}$, $Q_{67}$ and $Q_{75}$ were checked against the Python
+implementation.
+
+\section{The MaxSAT baseline}\label{sec:maxsat}
+
+For comparison we used a MaxSAT version of Coudert's MIP model for vertex
+separation~\cite{Cou16,CouCode}. We state it precisely here, because it
+measures the boundary on the opposite side of the cut from \cref{sec:kob},
+and the two conventions are related by reversing the ordering.
+
+\paragraph{Variables.} For $v\in V$ and $1\le t\le n$:
+\begin{itemize}
+\item $y_{v,t}$, meaning ``$v$ is among the first $t$ vertices'';
+\item $u_{v,t}$, meaning ``$v$ is counted in the boundary at time $t$'';
+\item $z_t$, the unary digits of the objective.
+\end{itemize}
+
+\paragraph{Hard clauses.}
+\begin{align}
+&\lnot y_{v,t}\lor y_{v,t+1} && v\in V,\ 1\le t<n, \label{eq:mono}\\
+&\textstyle\sum_{v} y_{v,t}=t && 1\le t\le n, \label{eq:card}\\
+&\lnot y_{v,t}\lor y_{w,t}\lor u_{v,t} && (v,w)\in A,\ 1\le t\le n, \label{eq:u}\\
+&z_t\lor\lnot z_{t+1} && 1\le t<n, \label{eq:zmono}\\
+&\textstyle\sum_{v} u_{v,t}+\sum_{s=1}^{n}\lnot z_s\le n && 1\le t\le n. \label{eq:zbound}
+\end{align}
+The cardinality constraints \eqref{eq:card} and \eqref{eq:zbound} are
+encoded with totalizers. For an undirected graph, each edge gives both arcs.
+
+\paragraph{Soft clauses.} $\lnot z_t$ with weight $1$, for $1\le t\le n$.
+
+Coudert's MIP also has variables $x_{v,t}$ for the closed neighbourhood of
+the prefix, and counts $x_{v,t}-y_{v,t}$, which is the boundary
+\emph{outside} the prefix. The MaxSAT version eliminates $x$. It counts
+instead the vertices \emph{inside} the prefix that have an out-neighbour
+outside it; this is the convention of Kinnersley's $V_L$~\cite{Kin92}.
+Since $u$ only enters an upper bound that is being minimised, clause
+\eqref{eq:u} needs to force $u_{v,t}$ in one direction only.
+
+For an ordering $\sigma$ with prefix sets $S_t$, write
+\[
+L_t(\sigma)=\set{v\in S_t:\ N^{+}(v)\not\subseteq S_t},
+\]
+where $N^{+}(v)$ is the set of out-neighbours of $v$.
+
+\begin{lemma}[Reversal]\label{lem:rev}
+Let $\sigma^{R}$ be the reverse of $\sigma$. Then
+$L_t(\sigma)=\Nm\bigl(V(\sigma^{R}_{n-t})\bigr)$ for $0\le t\le n$. Hence
+$\max_t|L_t(\sigma)|=\cost(\sigma^{R})$.
+\end{lemma}
+\begin{proof}
+$V(\sigma^{R}_{n-t})=V\setminus S_t$. The in-neighbours of $V\setminus S_t$
+that lie outside it are exactly the vertices of $S_t$ with an arc into
+$V\setminus S_t$.
+\end{proof}
+
+\begin{proposition}\label{prop:maxsat}
+The optimal cost of the MaxSAT instance is $\vs(D)$. Given an optimal model,
+let $f(v)=\min\set{t:y_{v,t}}$, and order the vertices by increasing $f$.
+The reverse of that ordering has width $\vs(D)$ in the convention of
+\cref{sec:kob}.
+\end{proposition}
+\begin{proof}
+By \eqref{eq:mono} and \eqref{eq:card}, the sets
+$S_t=\set{v:y_{v,t}}$ form a chain with $|S_t|=t$, so $f$ is a bijection
+onto $[n]$ and defines an ordering $\sigma$. Clause \eqref{eq:u} forces
+$u_{v,t}$ for every $v\in L_t(\sigma)$. Let $Z$ be the number of true
+$z_t$. By \eqref{eq:zmono} these are $z_1,\dots,z_Z$, so \eqref{eq:zbound}
+reads $\sum_v u_{v,t}\le Z$, and therefore $Z\ge\max_t|L_t(\sigma)|$.
+Conversely, setting $u_{v,t}$ true exactly on $L_t(\sigma)$ and
+$Z=\max_t|L_t(\sigma)|$ satisfies every hard clause. So the optimum is
+$\min_\sigma\max_t|L_t(\sigma)|$, which equals $\min_\sigma
+\cost(\sigma^{R})=\vs(D)$ by \cref{lem:rev}.
+\end{proof}
+
+We checked \cref{prop:maxsat} against \cref{alg:bucket} on 400 random graphs
+and digraphs with $n\le 9$. Both the optimal value and the width of the
+reversed ordering agreed in every case.
+
+The instance has $2n^2+n$ primary variables and $n|A|$ ternary clauses. Its
+$2n$ totalizers contribute $O(n^3)$ clauses in all. We solved it with the
+core-guided solver RC2~\cite{RC2} in PySAT~\cite{PySAT}, using the
+CaDiCaL~1.9.5 backend. RC2 lowers the bound on $Z$ through a sequence of
+unsatisfiable cores. In that respect it, like \cref{alg:bucket}, approaches
+the optimum from below. Each of its oracle calls, however, is a SAT problem
+over all $n$ time steps.
+
+\section{Experiments}\label{sec:exp}
+
+We tested the Python implementation against a brute-force $2^n$ dynamic
+program on 3000 random graphs and digraphs with $n\le 10$. In every case the
+returned value agreed, and the extracted ordering had width exactly
+$\vs(D)$. The C port reports the same numbers of discovered sets, popped
+pairs and rescans as the Python implementation on all the graphs below. Both
+programs recompute the width of the extracted ordering directly and check
+it against the returned value. All timings below are on one core of an
+Intel Xeon at 2.1\,GHz, using CPython~3.13 and \texttt{gcc -O3
+-march=native}~13.3. The graphs $g_1,g_2,g_3$ are Erd\H{o}s--R\'enyi graphs
+$G(n,p)$ with $(n,p)=(40,0.12)$, $(60,0.06)$ and $(45,0.15)$. The graph
+$Q_{63}$ is the \emph{square-sum graph} on $\set{1,\dots,63}$, in which
+$i\sim j$ exactly when $i+j$ is a perfect square; it has 135 edges.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+graph & $n$ & $\vs$ & $|\mathcal{D}|$ & Python (s) & C (s) & ratio\\
+\midrule
+$g_1$ & 40 & 11 & 4\,022 & 0.22 & 0.009 & $\approx 24$\\
+$g_3$ & 45 & 15 & 19\,608 & 1.45 & 0.026 & $\approx 56$\\
+$g_2$ & 60 & 11 & 732\,821 & 66--70 & 1.04 & $\approx 65$\\
+$Q_{63}$ & 63 & 14 & 364\,589 & 25.6 & 0.43 & $\approx 59$\\
+\bottomrule
+\end{tabular}
+\caption{One-pass search (\cref{alg:bucket}). The C time for $g_1$ is
+dominated by process start-up. Peak memory on $g_2$: Python 854\,MB, C
+288\,MB. On the author's own machine, $Q_{63}$ took 73.6\,s in Python and
+0.965\,s in C, a ratio of about 76.}\label{tab:time}
+\end{table}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+graph & $|\Rel_{\vs-1}|$ & $|\mathcal{D}|$ & $|\Rel_{\vs}|$ & sets found at level $\vs$\\
+\midrule
+$g_1$ & 3\,959 & 4\,022 & 9\,500 & 63\\
+$g_3$ & 18\,755 & 19\,608 & 44\,952 & 853\\
+\bottomrule
+\end{tabular}
+\caption{The sandwich of \cref{thm:work}. Here $|\Rel_k|$ is the number of
+sets generated by \cref{alg:kob} with bound $k$.}\label{tab:sandwich}
+\end{table}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+graph & bound $k$ & $|\Rel_k|$ & time (s) & time of \cref{alg:bucket} (s)\\
+\midrule
+$g_1$ & $\vs=11$ & 9\,500 & 0.62 & 0.22\\
+$g_1$ & 13 & 55\,297 & 4.7 & \\
+$g_1$ & 15 & 232\,170 & 28.6 & \\
+$g_3$ & $\vs=15$ & 44\,952 & 3.7 & 1.45\\
+$g_3$ & 17 & 258\,033 & 24.0 & \\
+\bottomrule
+\end{tabular}
+\caption{Cost of overshooting $k$ with \cref{alg:kob} (Python, same
+machine).}\label{tab:overshoot}
+\end{table}
+
+\paragraph{Comparison with MIP and MaxSAT.}
+\Cref{tab:mip} compares the C implementation of \cref{alg:bucket} with the
+MaxSAT model of \cref{sec:maxsat} on the same machine. On these graphs the
+C implementation is between roughly 300 and 1500 times faster. On the
+author's own machine the gap on $Q_{63}$ was larger still: 2637\,s for the
+MaxSAT model against 0.89\,s for the C implementation, a ratio of about
+3000. On those graphs
+the MaxSAT model was in turn often hundreds of times faster than Coudert's
+MIP solved with Gurobi~\cite{Gurobi}.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+graph & $n$ & $\vs$ & MIP/Gurobi (s) & MaxSAT/RC2 (s) & \cref{alg:bucket}, C (s) & MaxSAT\,/\,C\\
+\midrule
+$g_1$ & 40 & 11 & \emph{[tbd]} & 11.9 & 0.008 & $\approx 1500$\\
+$g_3$ & 45 & 15 & \emph{[tbd]} & 15.4 & 0.019 & $\approx 800$\\
+$g_2$ & 60 & 11 & \emph{[tbd]} & 305 & 1.04 & $\approx 290$\\
+$Q_{63}$ & 63 & 14 & \emph{[tbd]} & 198 & 0.43 & $\approx 460$\\
+\bottomrule
+\end{tabular}
+\caption{Exact methods compared on one core of the machine described above.
+The MaxSAT times are for RC2 with the CaDiCaL~1.9.5 backend (PySAT~1.9),
+including model construction. The C times include reading the graph and
+extracting and checking the ordering. The MIP column is to be filled in from
+the author's Gurobi runs.}\label{tab:mip}
+\end{table}
+
+\paragraph{Comparison with branch and bound.}
+We compared the C implementation with Sage's \texttt{vertex\_separation\_BAB}
+(Cython; passagemath~10 distribution~\cite{Sage}), which implements the
+greedy steps and prefix table of~\cite{CMN14} but not their reduction rules.
+We used its default limits: prefixes of length at most 20, and at most
+$10^6$ stored prefixes. The instances were the square-sum graphs
+$Q_{30},\dots,Q_{63}$, four grids, 36 random graphs $G(n,p)$ with
+$n\in\{30,40,50,60\}$ and average degree $3$, $4$ or $5$ (three seeds
+each), and 9 random digraphs. BAB was timed in-process, with a cap of
+120\,s; the C program was timed including process start-up. Whenever both
+finished, the widths agreed. \Cref{tab:bab} shows the harder instances and
+\cref{tab:babsum} a summary.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{lrrrrrrrr}
+\toprule
+& & & & \multicolumn{2}{c}{C, $U^*$} & \multicolumn{2}{c}{C, $U^{**}$} & BAB\\
+\cmidrule(lr){5-6}\cmidrule(lr){7-8}
+graph & $n$ & $m$ & $\vs$ & s & sets & s & sets & s\\
+\midrule
+$Q_{55}$ & 55 & 108 & 10 & 0.017 & 18\,126 & 0.009 & 8\,438 & 0.049\\
+$Q_{57}$ & 57 & 114 & 11 & 0.029 & 34\,445 & 0.027 & 18\,009 & 0.169\\
+$Q_{58}$ & 58 & 117 & 12 & 0.093 & 96\,416 & 0.060 & 46\,206 & 0.564\\
+$Q_{59}$ & 59 & 120 & 13 & 0.279 & 249\,962 & 0.156 & 92\,992 & 2.080\\
+$Q_{61}$ & 61 & 127 & 14 & 0.775 & 596\,416 & 0.330 & 188\,251 & 4.706\\
+$Q_{63}$ & 63 & 135 & 14 & 0.422 & 364\,589 & 0.252 & 157\,639 & 2.713\\
+grid $8\times8$ & 64 & 112 & 8 & 0.010 & 11\,045 & 0.005 & 1\,442 & 0.044\\
+$G(50,5,1)$ & 50 & 119 & 14 & 0.180 & 131\,856 & 0.069 & 31\,490 & 1.309\\
+$G(50,5,2)$ & 50 & 132 & 15 & 0.210 & 179\,617 & 0.091 & 42\,972 & 1.576\\
+$G(60,3,0)$ & 60 & 104 & 11 & 1.780 & 919\,483 & 0.493 & 143\,089 & 12.2\\
+$G(60,3,1)$ & 60 & 104 & 10 & 0.469 & 319\,193 & 0.168 & 67\,078 & 3.241\\
+$G(60,4,0)$ & 60 & 125 & 14 & 5.165 & 3\,019\,891 & 1.205 & 317\,110 & $>120$\\
+$G(60,4,1)$ & 60 & 128 & 13 & 1.545 & 998\,184 & 0.538 & 167\,512 & $>120$\\
+$G(60,4,2)$ & 60 & 120 & 12 & 0.821 & 643\,444 & 0.318 & 146\,301 & 7.866\\
+$G(60,5,0)$ & 60 & 158 & 16 & 0.753 & 548\,970 & 0.403 & 224\,144 & 5.378\\
+$G(60,5,1)$ & 60 & 159 & 17 & 1.565 & 1\,194\,285 & 0.889 & 396\,736 & $>120$\\
+$G(60,5,2)$ & 60 & 149 & 16 & 1.714 & 1\,200\,576 & 0.630 & 230\,728 & $>120$\\
+\bottomrule
+\end{tabular}
+\caption{The C implementation of \cref{alg:bucket}, with Kobayashi's
+expansion $U^*$ and with the stronger expansion $U^{**}$
+(\cref{sec:greedy2}), against the branch and bound of~\cite{CMN14} in Sage
+(cap 120\,s). $G(n,d,s)$ denotes a random graph with $n$ vertices,
+average degree $d$ and seed $s$.}\label{tab:bab}
+\end{table}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+family & instances & BAB $>120$\,s & BAB / C ($U^*$) & BAB / C ($U^{**}$) & sets $U^*$ / $U^{**}$\\
+\midrule
+square-sum $Q_{30..63}$ & 12 & 0 & 5.8 & 9.5 & 2.4\\
+grids & 4 & 0 & --- & --- & 6.1\\
+$G(30,\cdot,\cdot)$ & 9 & 0 & --- & --- & 2.6\\
+$G(40,\cdot,\cdot)$ & 9 & 0 & 7.4 & 11.1 & 2.9\\
+$G(50,\cdot,\cdot)$ & 9 & 0 & 7.7 & 19.9 & 4.5\\
+$G(60,\cdot,\cdot)$ & 9 & 4 & 7.6 & 21.8 & 5.1\\
+random digraphs & 9 & 0 & --- & --- & 2.4\\
+\bottomrule
+\end{tabular}
+\caption{Geometric means of time ratios, over the instances on which BAB
+finished and the C program ($U^*$) took at least 10\,ms; shorter runs are
+dominated by process start-up. The last column covers all instances.}\label{tab:babsum}
+\end{table}
+
+With its default limits BAB exceeded the cap on four $G(60,\cdot,\cdot)$
+instances. Rerun with prefixes of any length and up to $10^7$ stored
+prefixes, it solved them in 12.3, 43.2, 19.5 and 13.3\,s ($G(60,4,1)$,
+$G(60,4,0)$, $G(60,5,1)$, $G(60,5,2)$). These times are 8--13 times the C
+times with $U^*$, and 21--36 times those with $U^{**}$. With the default
+limits, $G(60,4,1)$ still had not finished after 600\,s. So the timeouts
+come from the cap on stored prefixes, not from the search itself. We did
+not rerun the other instances with raised limits.
+
+The two programs are much closer to each other than either is to the
+MaxSAT model, and there is a structural reason. A branch and bound that
+proves optimality must refute every prefix of width below the final upper
+bound $\vs(D)$. With a memo on prefix sets, it therefore explores a family
+of greedily closed sets comparable to $\Rel_{\vs(D)-1}$, the lower end of
+the sandwich in \cref{thm:work}, which \cref{alg:bucket} also visits. (This
+is a heuristic explanation; the two expansion rules and the depth-first
+order make the families differ in detail.) The remaining differences are constants (bit-parallel C against
+Cython with a Python set of frozensets), the stronger expansion, and BAB's
+cap on stored prefixes. Once the cap is reached, sets deeper than 20 are
+no longer memoised, and they can be re-explored many times.
+
+\paragraph{Optimal orderings and secondary costs.}
+\Cref{tab:orders} shows the complete DAG $\Gamma$ for square-sum graphs, and
+the time to minimise a step-local proxy cost over it. The cost is the one
+the author uses to tune a frontier dynamic program for counting Hamiltonian
+paths. Writing $f$ for the new frontier size, $b$ for the number of edges
+from $v$ into the frontier, $\epsilon$ for the number of edges inside the
+frontier, $\rho\le1$ for a component correction, and $\ell$ for the number of
+eliminations, a step contributes
+$e=1.55^{b}(f/k)^2\rho\,(1+\epsilon/(4f))$,
+$\kappa=\max(2^{-\ell},0.01)$ and $a=0.001f$. The Pareto fronts never held
+more than one label on these graphs; on a random graph $g_1$ they reached
+six. We checked our implementation of the cost against the author's code to
+$10^{-9}$ on sampled orderings and on the optima. For comparison, the family
+of \emph{all} optimal orderings, enumerated by their prefix sets, has
+$5.36$M sets for $Q_{50}$, $8.97$M for $Q_{55}$ and $51.7$M for $Q_{57}$, and
+did not fit in 7\,GB for $Q_{58}$.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+graph & $\vs$ & $|\Rel_{\vs}|$ & nodes of $\Gamma$ & orderings & C, complete (s) & optimise (s)\\
+\midrule
+$Q_{57}$ & 11 & 99\,463 & 13\,762 & $1.6\times10^{26}$ & 0.12 & 2\\
+$Q_{58}$ & 12 & 278\,855 & 45\,056 & $3.6\times10^{28}$ & 0.38 & 9\\
+$Q_{59}$ & 13 & 762\,813 & 151\,041 & $2.0\times10^{31}$ & 1.32 & 33\\
+$Q_{61}$ & 14 & 1\,665\,113 & 263\,672 & $2.2\times10^{33}$ & 3.37 & 66\\
+\bottomrule
+\end{tabular}
+\caption{The complete DAG $\Gamma$. The orderings column counts paths, with
+one canonical order inside each expansion block. The optimisation of the
+proxy cost was done in Python.}\label{tab:orders}
+\end{table}
+
+How much is lost by restricting to $\Gamma$? \Cref{tab:gammaloss} compares
+the exact optimum over $\Gamma$ with the exact optimum over all optimal
+orderings, for an additive cost and for the proxy cost. On these graphs the
+loss is at most 1.5\%. Restricting further to the stronger expansion costs
+much more: for $Q_{40}$ the proxy optimum rises from 3.59 to 4.74, and for
+$Q_{45}$ from 1.45 to 2.43. These are empirical observations on small
+graphs.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+& & \multicolumn{2}{c}{additive (V2)} & \multicolumn{2}{c}{proxy (V7)} & \\
+\cmidrule(lr){3-4}\cmidrule(lr){5-6}
+graph & $\vs$ & all & $\Gamma$ & all & $\Gamma$ & largest ratio\\
+\midrule
+$Q_{20}$ & 3 & 9.032 & 9.143 & 6.372 & 6.380 & 1.012\\
+$Q_{22}$ & 3 & 15.599 & 15.710 & 9.510 & 9.519 & 1.007\\
+$Q_{25}$ & 4 & 18.629 & 18.691 & 7.780 & 7.814 & 1.004\\
+$Q_{28}$ & 5 & 20.730 & 20.770 & 5.615 & 5.698 & 1.015\\
+\bottomrule
+\end{tabular}
+\caption{Exact optimum of two secondary costs over all pathwidth-optimal
+orderings and over those of $\Gamma$. V2 is
+$\sum_s 2^{b}(f/k)^2+0.001\sum_s f$.}\label{tab:gammaloss}
+\end{table}
+
+These comparisons should be read with the different scaling of the methods
+in mind. The running time of \cref{alg:bucket} is governed by
+$|\Rel_{\vs(D)}|\le 3^{\tau(D)}$. It is therefore at its best on graphs with
+small vertex cover number, or more precisely few relevant sets, whatever the
+value of $n$, and it can run out of memory on graphs with large $\tau$. The
+performance of the MIP and MaxSAT approaches depends on quite different
+structural features.
+
+\FloatBarrier
+\section{Conclusion}
+
+Kobayashi's relevant-set dynamic program has a $k$-independent transition
+cost. This turns the decision procedure into a single bottleneck
+shortest-path computation. The resulting algorithm finds the exact pathwidth
+and an optimal ordering in one pass, with the same $3^{\tau(D)}n^{O(1)}$
+worst-case bound, and its work is sandwiched between one decision run just
+below the optimum and one at the optimum. The only delicate point in
+extracting the ordering is to emit the vertices of each expansion step in
+the order in which they become subsumed.
+
+The second greedy rule of Coudert, Mazauric and Nisse fits into the
+expansion and reduces the work further. Completing the final level turns
+the search into a compact representation of a very large family of optimal
+orderings. Over that family, step-local secondary costs, including costs
+with a multiplicative carry, can be minimised exactly, rather than searched
+by local moves. On our graphs the restriction to this family cost at most
+1.5\% against the optimum over all optimal orderings, and that larger family
+quickly became too big to enumerate.
+
+The method is not specific to pathwidth. It needs three things: a step
+cost that depends only on the prefix set and the next vertex, a min--max
+objective, and greedy rules that do not depend on the width bound. For a
+submodular prefix cost the rules come from a single lemma, which explains
+both published rules for pathwidth and gives exact cutwidth over at most
+$2^{\tau}$ states. Treewidth satisfies the first two conditions but has
+weak rules and much stronger dedicated methods. Bandwidth fails the first.
+Linear rank-width, whose cut-rank function is submodular, is a natural next
+candidate.
+
+\begin{thebibliography}{99}
+\bibitem{BFKKT12}
+H.~L. Bodlaender, F.~V. Fomin, A.~M.~C.~A. Koster, D.~Kratsch, D.~M. Thilikos,
+A note on exact algorithms for vertex ordering problems on graphs,
+\emph{Theory Comput.\ Syst.} 50(2) (2012) 420--432.
+
+\bibitem{CLTV13}
+M.~Chapelle, M.~Liedloff, I.~Todinca, Y.~Villanger,
+Treewidth and pathwidth parameterized by the vertex cover number,
+in: \emph{Proc.\ WADS 2013}, LNCS 8037, 2013, pp.~232--243.
+
+\bibitem{CMN14}
+D.~Coudert, D.~Mazauric, N.~Nisse,
+Experimental evaluation of a branch and bound algorithm for computing
+pathwidth,
+Research report RR-8470, Inria, 2014, hal-00943549.
+
+\bibitem{Cou16}
+D.~Coudert,
+A note on integer linear programming formulations for linear ordering
+problems on graphs,
+Research report hal-01271838, Inria, 2016.
+
+\bibitem{CouCode}
+D.~Coudert,
+Linear ordering problems on graphs (code),
+\url{https://www-sop.inria.fr/members/David.Coudert/code/graph-linear-ordering.shtml}.
+
+\bibitem{CLPPS14}
+M.~Cygan, D.~Lokshtanov, M.~Pilipczuk, M.~Pilipczuk, S.~Saurabh,
+On cutwidth parameterized by vertex cover,
+\emph{Algorithmica} 68(4) (2014) 940--953.
+
+\bibitem{CP12}
+M.~Cygan, M.~Pilipczuk,
+Even faster exact bandwidth,
+\emph{ACM Trans.\ Algorithms} 8(1) (2012), article~8; arXiv:0902.1661.
+
+\bibitem{BBNNPR13}
+T.~Biedl, T.~Bl\"asius, B.~Niedermann, M.~N\"ollenburg, R.~Prutkin, I.~Rutter,
+Using ILP/SAT to determine pathwidth, visibility representations, and other
+grid-based graph drawings, arXiv:1308.6778, 2013.
+
+\bibitem{Dij59}
+E.~W. Dijkstra,
+A note on two problems in connexion with graphs,
+\emph{Numer.\ Math.} 1 (1959) 269--271.
+
+\bibitem{Gurobi}
+Gurobi Optimization, LLC,
+Gurobi Optimizer Reference Manual, \url{https://www.gurobi.com}.
+
+\bibitem{RC2}
+A.~Ignatiev, A.~Morgado, J.~Marques-Silva,
+RC2: an efficient MaxSAT solver,
+\emph{J.\ Satisf.\ Boolean Model.\ Comput.} 11(1) (2019) 53--64.
+
+\bibitem{PySAT}
+A.~Ignatiev, A.~Morgado, J.~Marques-Silva,
+PySAT: a Python toolkit for prototyping with SAT oracles,
+in: \emph{Proc.\ SAT 2018}, LNCS 10929, 2018, pp.~428--437.
+
+\bibitem{GS84}
+E.~M. Gurari, I.~H. Sudborough,
+Improved dynamic programming algorithms for bandwidth minimization and the
+MinCut linear arrangement problem,
+\emph{J.\ Algorithms} 5(4) (1984) 531--546.
+
+\bibitem{KF79}
+T.~Kashiwabara, T.~Fujisawa,
+NP-completeness of the problem of finding a minimum-clique-number interval
+graph containing a given graph as a subgraph,
+in: \emph{Proc.\ ISCAS 1979}, pp.~657--660.
+
+\bibitem{Kin92}
+N.~G. Kinnersley,
+The vertex separation number of a graph equals its path-width,
+\emph{Inform.\ Process.\ Lett.} 42(6) (1992) 345--350.
+
+\bibitem{KKKTT12}
+K.~Kitsunai, Y.~Kobayashi, K.~Komuro, H.~Tamaki, T.~Tano,
+Computing directed pathwidth in $O(1.89^n)$ time,
+in: \emph{Proc.\ IPEC 2012}, LNCS 7535, 2012, pp.~182--193.
+
+\bibitem{Kob15}
+Y.~Kobayashi,
+Computing the pathwidth of directed graphs with small vertex cover,
+\emph{Inform.\ Process.\ Lett.} 115 (2015) 310--312.
+
+\bibitem{Knu77}
+D.~E. Knuth,
+A generalization of Dijkstra's algorithm,
+\emph{Inform.\ Process.\ Lett.} 6(1) (1977) 1--5.
+
+\bibitem{Mal18}
+S.~Mallach,
+Linear ordering based MIP formulations for the vertex separation or
+pathwidth problem,
+\emph{J.\ Discrete Algorithms} 52--53 (2018) 156--168.
+
+\bibitem{Pol60}
+M.~Pollack,
+The maximum capacity through a network,
+\emph{Oper.\ Res.} 8(5) (1960) 733--736.
+
+\bibitem{Sax80}
+J.~B. Saxe,
+Dynamic programming algorithms for recognizing small-bandwidth graphs in
+polynomial time,
+\emph{SIAM J.\ Algebraic Discrete Methods} 1(4) (1980) 363--369.
+
+\bibitem{Sage}
+The Sage Developers, SageMath; modularised as passagemath,
+\url{https://www.sagemath.org}, \url{https://github.com/passagemath/passagemath};
+module \texttt{sage.graphs.graph\_decompositions.vertex\_separation}.
+
+\bibitem{SV09}
+K.~Suchan, Y.~Villanger,
+Computing pathwidth faster than $2^n$,
+in: \emph{Proc.\ IWPEC 2009}, LNCS 5917, 2009, pp.~324--335.
+
+\bibitem{Tam11}
+H.~Tamaki,
+A polynomial time algorithm for bounded directed pathwidth,
+in: \emph{Proc.\ WG 2011}, LNCS 6986, 2011, pp.~331--342.
+
+\bibitem{Tam19}
+H.~Tamaki,
+Positive-instance driven dynamic programming for treewidth,
+\emph{J.\ Comb.\ Optim.} 37(4) (2019) 1283--1311; conference version in
+\emph{Proc.\ ESA 2017}, LIPIcs 87, 68:1--68:13.
+
+\bibitem{YC08}
+B.~Yang, Y.~Cao,
+Digraph searching, directed vertex separation and directed pathwidth,
+\emph{Discrete Appl.\ Math.} 156(10) (2008) 1822--1837.
+\end{thebibliography}
+
+\end{document}
