@@ -892,4 +892,97 @@ Next, as you asked, I'll start the Lean formalisation. I plan to begin with:
 The vertex-cover normal form would come last, since it's the expensive
 one.
 
+Question
+--------
+Do the lean formalization. Also, why is the generated C code slightly
+slower than the handcrafted kpw (for instance). Can code generation
+from the DSL be made to match that?
+
+Answer
+------
+I'll set up a Lean project inside the repo (Lean 4.36.0 + Mathlib v4.36.0, the latest stable pair) and build it with the Lean server on your Mac.
+
+While Mathlib's cache downloads, I'll write the formalization. First the core definitions and the move-system theorem:
+
+Now the greedy lemma and the completeness of greedy-closure systems — the mathematical heart:
+
+Width.lean compiles (it was just Mathlib's first cold load). Checking the rest:
+
+MoveSystem.lean compiles, with only a linter warning. Now pushing Instances.lean and checking Engine and Greedy:
+
+Two small errors, both elaboration-order issues. Fixing:
+
+While Engine.lean elaborates, I'll write up the code-generation performance analysis:
+
+Engine.lean compiles cleanly. Now the fixed Greedy.lean:
+
+Greedy.lean (the greedy lemma and completeness of greedy-closure systems) now compiles with no errors. Checking Instances.lean:
+
+Two small errors in the cut-increment proof. Fixing:
+
+All five Lean files now elaborate with no errors and no `sorry`. To confirm nothing rests on unproved assumptions, I'll print the axioms each main theorem depends on:
+
+Meanwhile, committing the code-generation changes. I'm staging them under fresh names and verifying every file by checksum, including files from the earlier milestone commit:
+
+Everything matches except `doc/dsl_design.md`: your copy is stale from the same transfer bug, so the later revision (§8.7 on the compiler) never reached you. Re-sending it:
+
+Meanwhile, the Lean documentation:
+
+Every main theorem depends only on Lean's three standard axioms. Final docs and commit:
+
+The Lean formalisation is done and checks on your Mac: kpw is proved correct with or without `-g`, and so is cutwidth with the rank closure only. The generated code is no longer slower than kpw; it was one missing optimisation, now fixed.
+
+## Lean formalisation (`lean/`, Lean 4.36.0 + Mathlib v4.36.0)
+
+It is about 600 lines in five files and compiles with no `sorry` and no errors. An axiom audit (`Axioms.lean`) shows every main theorem depends only on `propext`, `Classical.choice` and `Quot.sound`.
+
+- **Value theorem (`value_iff`).** For any move system satisfying the root, exact-arc-cost and completeness obligations (O0–O2), a bound is achieved if and only if it is at least the width.
+- **Engine correctness.** Lean proves the facts behind Theorem E:
+  - an empty stack at level B means the table is exactly the B-reachable set;
+  - jumping straight to the smallest bucketed cost is safe;
+  - the windowed rescan offers exactly the moves not offered before;
+  - the first level at which V appears is the width, and an interrupted run's `lb=B` is a valid lower bound.
+- **Greedy lemma (`greedy_front`).** For f with diminishing returns, if f(S+v) ≤ f(S), moving v to the front of a completion doesn't raise its bottleneck.
+- **Greedy-closure systems.** "Choose any x, then close" is correct for *any* closure rule that never raises f, provided f has diminishing returns and f(∅) = 0 (`greedySystem_value`).
+- **Instances:**
+  - **kpw is correct (`kpw_value`).** The boundary cost |N⁻(S) ∖ S| has diminishing returns, and Kobayashi's rule 1 and the CMN rule 2 never raise it.
+  - **Cutwidth with the rank closure is correct (`kcw_closure_value`).** This rests on the exact cut increment, cut(S+x) + |N(x) ∩ S| = cut(S) + |N(x) ∖ S|.
+
+**Not yet covered:**
+- **The C engine itself.** The engine is modelled by its invariants, not by `dsl_engine.h`'s data structures. The randomized checks still cover that gap only empirically.
+- **kcw's cover restriction and twin rule.** kcw's vertex-cover normal form (the expensive one) and the twin symmetry rule are not formalised, so `kcw_closure_value` corresponds to `cutwidth(cover=False, twins=False)` only.
+- **Other gaps.** The quotient-key decode lemma, pathwidth = vertex separation, and treewidth's simplicial closure are also not done.
+
+`lean/README.md` (attached) lists all of this.
+
+## Why the generated code was slower than kpw, and the fix
+
+It was only slower with `-g`; without it, it was already faster (11.9 s vs 17.1 s over the 61 benchmark graphs).
+
+**Cause.** kpw looks for rule-2 vertices only among the current in-neighbour boundary (nb ∖ U). The generated closure swept every vertex in every pass and tested both rules everywhere. Most vertices failed rule 2 at its first condition, v ∈ nb(S), but were still visited.
+
+I first ruled out the other suspect, recomputing nb when a state is decoded. Storing it with each state instead made things slightly *slower* (9.10 s vs 8.36 s on the five largest graphs), so that option exists but is off by default.
+
+**Fix.** The fix is a general compiler optimisation, not a kpw special case. For a closure rule of the form v ∈ A(S) ∧ …, the compiler now loops over A(S) ∖ T only, and each rule is swept separately until nothing changes. This is valid because the rules are monotone: the closed set is the unique fixpoint whatever the order.
+
+**Results (61 benchmark graphs, all widths agree):**
+
+| mode | DSL | kpw |
+|---|---|---|
+| without `-g` | 10.4 s | 15.2 s |
+| with `-g` | 3.5 s | 5.3 s |
+
+**Individual instances.** A few still lose on their own; for example gnp_n60_d5_s1 without `-g` takes 1.60 s vs 1.44 s. That is not code quality: the two programs search the final level in different orders, so they visit different numbers of states before reaching V (1.75 M vs 1.19 M).
+
+**Can generation always match hand-written code?** Not as a theorem. It works whenever each hand-written trick is either a general rewrite the compiler knows or a data-layer choice you can name. Both slowdowns so far (popcounts on large graphs, the rule-2 sweep) were missing general optimisations. `doc/dsl_codegen_perf.md` (attached) has the details.
+
+## A transfer problem you should know about
+
+While verifying, I found that re-sending a file to your Mac from the same staging location sometimes delivered an older copy. It silently left `doc/dsl_design.md` stale; it's fixed now. I now stage under fresh names and compared checksums for every file touched in the DSL and Lean work, and all match. Only the Lean files and `.gitignore` (I added `lean/.lake/`, since Mathlib's cache there is several GB) were written in place rather than sent.
+
+Nothing has been committed to git. Building from a cold start on your Mac takes 10–25 minutes per Lean file, mostly loading Mathlib for the first time; later builds are fast.
+
+The natural next Lean step is a general symmetry lemma (restricting
+choices to one representative per orbit of a group preserving the
+costs), with twins as an instance, and then the cover normal form.
 
