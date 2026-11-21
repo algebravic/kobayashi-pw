@@ -16,7 +16,7 @@ import subprocess
 import threading
 from pathlib import Path
 
-ENGINE_VERSION = "1"
+ENGINE_VERSION = "2"
 W_BUCKETS = (1, 2, 3, 4, 5, 6, 8, 11, 16, 24, 32)
 CFLAGS = ["-O3", "-march=native", "-shared", "-fPIC"]
 DEBUG_CFLAGS = ["-O1", "-g", "-shared", "-fPIC", "-fsanitize=undefined"]
@@ -89,7 +89,9 @@ def build(ops_src: str, W: int, debug: bool = False) -> ctypes.CDLL:
     cdir = c_dir()
     rt, eng = (cdir / "dsl_rt.h").read_text(), (cdir / "dsl_engine.h").read_text()
     flags = DEBUG_CFLAGS if debug else CFLAGS
-    src = f"#define W {W}\n#include \"dsl_rt.h\"\n{ops_src}\n#include \"dsl_engine.h\"\n"
+    pre = "\n".join(l for l in ops_src.splitlines() if l.startswith("#define DSL_"))
+    body = "\n".join(l for l in ops_src.splitlines() if not l.startswith("#define DSL_"))
+    src = f"#define W {W}\n{pre}\n#include \"dsl_rt.h\"\n{body}\n#include \"dsl_engine.h\"\n"
     h = hashlib.sha256("\0".join([ENGINE_VERSION, src, rt, eng, _ident(cc), " ".join(flags)]).encode()).hexdigest()[:24]
     with _lock:
         if h in _loaded:

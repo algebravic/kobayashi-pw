@@ -115,14 +115,14 @@ class Problem:
         self.split_components = True
 
     # ------------------------------------------------------------ Layer D
-    def impl(self, maintain=(), probe=False, closure="auto"):
+    def impl(self, maintain=(), probe=False, closure="auto", carry=False):
         """Layer D.  maintain: quantities kept incrementally, each either
           S -> ⋃_{u∈S} F(u)          (a set; children copy it), or
           (S, v) -> |F(v) ∩ S|      (a vertex-indexed counter family; moves are
                                      applied in place and undone).
         F ∈ {N, Nin, Nout}."""
         import inspect
-        self.ann = {"maintain": list(maintain), "probe": probe, "closure": closure}
+        self.ann = {"maintain": list(maintain), "probe": probe, "closure": closure, "carry": carry}
         self.maintained, self.families = [], []
         for m in maintain:
             if len(inspect.signature(m).parameters) == 2:

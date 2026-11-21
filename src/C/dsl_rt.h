@@ -44,9 +44,15 @@ static inline int is_full(const u64 *T, const Consts *K) {
 /* ---- state table: keys (W words), parent id, label x ---- */
 typedef struct { uint32_t id; int lo; } Item;
 
+#ifndef DSL_CARRY_WORDS
+#define DSL_CARRY_WORDS 0
+#endif
+#define CW (DSL_CARRY_WORDS * W)     /* carried words per state (maintained sets) */
+
 typedef struct {
     const Consts *K;
     u64 *keys; uint32_t *par; int32_t *lab; size_t ns, cap;
+    u64 *cm;                          /* CW words per state, when DSL_CARRY_WORDS > 0 */
     uint32_t *ht; size_t hmask;
     Item *stack; size_t sp, scap;
     Item **bk; size_t *blen, *bcap; int nb;
@@ -95,7 +101,7 @@ static inline void eng_push(Eng *E, uint32_t id, int lo) {
     E->stack[E->sp].id = id; E->stack[E->sp].lo = lo; E->sp++;
 }
 
-static long eng_insert(Eng *E, const u64 *key, uint32_t parent, int x) {   /* new id, or -1 if present */
+static long eng_insert(Eng *E, const u64 *key, uint32_t parent, int x, const u64 *cm) {   /* new id, or -1 */
     size_t slot;
     if (eng_find(E, key, &slot) >= 0) return -1;
     if (E->ns == E->cap) {
@@ -105,18 +111,28 @@ static long eng_insert(Eng *E, const u64 *key, uint32_t parent, int x) {   /* ne
         int32_t *l = realloc(E->lab, nc * sizeof(int32_t));
         if (!k || !p || !l) { E->oom = 1; if (k) E->keys = k; if (p) E->par = p; if (l) E->lab = l; return -1; }
         E->keys = k; E->par = p; E->lab = l; E->cap = nc;
+#if DSL_CARRY_WORDS
+        u64 *c = realloc(E->cm, nc * CW * sizeof(u64));
+        if (!c) { E->oom = 1; return -1; }
+        E->cm = c;
+#endif
     }
     uint32_t id = (uint32_t)E->ns++;
     memcpy(E->keys + (size_t)id * W, key, W * sizeof(u64));
     E->par[id] = parent; E->lab[id] = x;
+#if DSL_CARRY_WORDS
+    memcpy(E->cm + (size_t)id * CW, cm, CW * sizeof(u64));
+#else
+    (void)cm;
+#endif
     E->ht[slot] = id + 1;
     if (2 * E->ns > E->hmask + 1) eng_rehash(E, 2 * (E->hmask + 1));
     return id;
 }
 
 /* called by generated expand(): returns 1 when V has been reached */
-static inline int eng_offer(Eng *E, const u64 *key, uint32_t parent, int x, int full) {
-    long id = eng_insert(E, key, parent, x);
+static inline int eng_offer(Eng *E, const u64 *key, uint32_t parent, int x, int full, const u64 *cm) {
+    long id = eng_insert(E, key, parent, x, cm);
     if (id < 0) return 0;
     if (full) { E->done = id; return 1; }
     eng_push(E, (uint32_t)id, -1);

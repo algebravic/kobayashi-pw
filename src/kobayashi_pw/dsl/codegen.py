@@ -300,18 +300,36 @@ def _closure_trigger_ok(prob, pred):
     return scan(pred)
 
 
+def guard_split(prob, pred):
+    """pred = (v ∈ A) ∧ rest with A independent of v  →  (A, rest); else (None, pred).
+    The word template of A is evaluated per word as the scan proceeds; A must be
+    a function of S only (it may grow as vertices are added: that is harmless,
+    since the outer loop repeats until no rule fires)."""
+    v = prob.v.node
+    if pred.op == "land":
+        g, rest = pred.args
+        if g.op == "member" and g.args[0] is v and prob.v_name not in g.args[1].free:
+            return g.args[1], rest
+    if pred.op == "member" and pred.args[0] is v and prob.v_name not in pred.args[1].free:
+        return pred.args[1], None
+    return None, pred
+
+
 def generate(prob) -> str:
     """C source of the ops for prob (to be compiled with dsl_rt.h / dsl_engine.h)."""
     p = prob
     maint = {m: i for i, m in enumerate(p.maintained)}
     nm = len(maint)
     out = []
-    out.append(f"/* generated from problem {p.name!r}; do not edit */")
     fams = p.families
     inplace = bool(fams)
+    carry = bool(maint) and not fams and p.key_node is p.S.node and p.ann.get("carry", False)
+    out.append(f"#define DSL_CARRY_WORDS {nm if carry else 0}   /* maintained sets stored with each state */")
+    out.append(f"/* generated from problem {p.name!r}; do not edit */")
     out.append("typedef struct { u64 m[1]; " + " ".join(f"u64 m{i}[W];" for i in range(nm))
                + " ".join(f"int c{i}[64 * W];" for i in range(len(fams))) + " } Mt;")
     REV = {"N": "K->NB", "Nin": "K->NOUT", "Nout": "K->NIN"}   # u ∈ F(w)  ⇔  w ∈ REV_F(u)
+    out.append("#define MT_CARRY_PTR(mt) " + ("(&(mt)->m0[0])" if carry else "((u64 *)0)"))
 
     def fn(sig, build):
         L = Lowerer(p, maint)
@@ -385,26 +403,37 @@ def generate(prob) -> str:
             L.ind -= 1
             L.emit("}")
         else:
+            # Sweeps to the fixpoint, one rule at a time.  A rule whose predicate has a
+            # leading guard  v ∈ A(S) ∧ …  only scans A(S) ∖ T (the guard is then
+            # dropped from the test).  Monotone rules: the fixpoint does not depend on
+            # the order of additions.
             L.emit("for (;;) {")
             L.ind += 1
             L.emit("int ch = 0;")
-            u = "v"
-            def body():
-                L.emit(f"if (T[{u} >> 6] >> ({u} & 63) & 1) continue;")
-                r = test_and_add(u)
-                L.emit(f"if ({r}) {{ st_add(T, mt, {u}, K); if (rec) rec[nr] = {u}; nr++; ch = 1; }}")
-            # sweep over V ∖ T (re-evaluated per word)
-            L.emit("for (int w0 = 0; w0 < W; w0++) {")
-            L.ind += 1
-            L.emit("u64 m0 = K->FULLW[w0] & ~T[w0];")
-            L.emit("while (m0) {")
-            L.push()
-            L.emit("int v = w0 * 64 + __builtin_ctzll(m0); m0 &= m0 - 1;")
-            body()
-            L.pop()
-            L.emit("}")
-            L.ind -= 1
-            L.emit("}")
+            for c in p.closures:
+                dom, pred = guard_split(p, c.pred)
+                L.emit("{")
+                L.push()
+                tmpl = L.word(dom) if dom is not None else None
+                L.emit("for (int w0 = 0; w0 < W; w0++) {")
+                L.ind += 1
+                if tmpl is None:
+                    L.emit("u64 m0 = K->FULLW[w0] & ~T[w0];")
+                else:
+                    L.emit(f"u64 m0 = {tmpl.replace(WI, 'w0')} & ~T[w0];")
+                L.emit("while (m0) {")
+                L.push()
+                L.emit("int v = w0 * 64 + __builtin_ctzll(m0); m0 &= m0 - 1;")
+                L.emit("if (T[v >> 6] >> (v & 63) & 1) continue;")
+                L.env[p.v_name] = "v"
+                r = L.bool(pred) if pred is not None else "1"
+                L.emit(f"if ({r}) {{ st_add(T, mt, v, K); if (rec) rec[nr] = v; nr++; ch = 1; }}")
+                L.pop()
+                L.emit("}")
+                L.ind -= 1
+                L.emit("}")
+                L.pop()
+                L.emit("}")
             L.emit("if (!ch) break;")
             L.ind -= 1
             L.emit("}")
@@ -506,13 +535,13 @@ def generate(prob) -> str:
                 L.emit("make_key(T, key, K);")
                 L.emit("int full = is_full(T, K);")
                 L.emit("for (int k = nr; k-- > 0;) st_del(T, &mt2, rec[k], K);")
-                L.emit("if (eng_offer(E, key, id, x, full)) return -1;")
+                L.emit("if (eng_offer(E, key, id, x, full, MT_CARRY_PTR(&mt2))) return -1;")
                 L.ind -= 1
                 L.emit("}")
             else:
                 apply_move(L, rec=False)
                 L.emit("make_key(T, key, K);")
-                L.emit("if (eng_offer(E, key, id, x, is_full(T, K))) return -1;")
+                L.emit("if (eng_offer(E, key, id, x, is_full(T, K), MT_CARRY_PTR(&mt2))) return -1;")
         L.foreach(p.move.over_minus_S, "x", body)
         L.emit("return next;")
     out += fn("static int expand(Eng *E, uint32_t id, const u64 *S, const Mt *mt, int lo, int B)", b_expand)

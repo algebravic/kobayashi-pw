@@ -15,7 +15,11 @@ static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t
 static void decode(Eng *E, uint32_t id, u64 *S, Mt *mt) {
     const Consts *K = E->K;
     memcpy(S, E->keys + (size_t)id * W, W * sizeof(u64));
+#if DSL_CARRY_WORDS
+    memcpy(MT_CARRY_PTR(mt), E->cm + (size_t)id * CW, CW * sizeof(u64));   /* carried, not recomputed */
+#else
     mt_init(S, mt, K);
+#endif
 #if !KEY_IDENTITY
     u64 cand[W];
     for (int w = 0; w < W; w++) cand[w] = K->FULLW[w] & ~S[w];
@@ -55,7 +59,7 @@ int dsl_solve(const Consts *K, const Params *P, Result *R) {
     nrec = closure(S, &mt, K, cand, rec, 0);      /* root = closure(empty) */
     int nroot = nrec;
     make_key(S, key, K);
-    eng_insert(&E, key, UINT32_MAX, -1);
+    eng_insert(&E, key, UINT32_MAX, -1, MT_CARRY_PTR(&mt));
     int B = 0, status = 0;
     double expansions = 0;
     if (is_full(S, K)) E.done = 0;
@@ -104,7 +108,7 @@ out:
     R->states = (double)E.ns;
     R->expansions = expansions;
     R->seconds = now_s() - t0;
-    free(rec); free(E.keys); free(E.par); free(E.lab); free(E.ht); free(E.stack);
+    free(rec); free(E.keys); free(E.par); free(E.lab); free(E.cm); free(E.ht); free(E.stack);
     for (int i = 0; i < E.nb; i++) free(E.bk[i]);
     free(E.bk); free(E.blen); free(E.bcap);
     return status;
