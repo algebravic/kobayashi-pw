@@ -9,3 +9,6 @@ wheels/
 # Virtual environments
 .venv
 src/C/kpw
+
+# Lean build artefacts (Mathlib cache is several GB)
+lean/.lake/
