@@ -58,6 +58,16 @@ treewidth().solve(small_graph, mode="eager")  # IR interpreter (the reference se
 
 The design is in `doc/dsl_design.md`, and the plan and results of the first milestone are in `doc/dsl_milestone1.md`. The generated vertex separation and cutwidth programs reproduce kpw and kcw: the same widths, and the same state counts on structured graphs. They run at 0.2–0.9× the hand-written programs' time, except for kpw's `-g`, where they take up to 1.45×.
 
+### Lean formalisation (`lean/`)
+
+`lake exe cache get && lake build` in `lean/` checks machine proofs of:
+- the move-system value theorem;
+- the engine's level-by-level correctness;
+- the greedy lemma;
+- the correctness of kpw (with or without `-g`) and of the cutwidth search with the rank closure.
+
+What is and is not covered is listed in `lean/README.md`.
+
 ### kcw (`src/C/kcw.c`): exact cutwidth
 
 ```

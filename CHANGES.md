@@ -1,3 +1,16 @@
+# Changes (8): Lean formalisation; codegen closure push-down
+
+- **`lean/`** (new): a Lean 4.36 / Mathlib v4.36 formalisation with no `sorry`; the axiom audit shows only `propext`, `Classical.choice` and `Quot.sound`. It proves:
+  - the move-system value theorem (`value_iff`);
+  - the facts behind engine E (`width_eq_of_first`, `width_ge_of_interrupted`, `closed_eq_reach`, `skip_levels`);
+  - the greedy lemma and the completeness of greedy-closure systems (`greedySystem_value`);
+  - **kpw is correct**, with rule 1 or rules 1 + 2 (`kpw_value`);
+  - **the cutwidth search with the rank closure is correct** (`kcw_closure_value`).
+
+  The cover normal form and twins are not yet formalised. See `lean/README.md`.
+- **`dsl/codegen.py`**: guard push-down. A closure rule `v ∈ A(S) ∧ …` now scans only A(S) ∖ T, and rules are swept one at a time to the fixpoint. With `-g`, DSL vertex separation goes from 7.3 s to 3.5 s on the benchmark set, against kpw -g's 5.3 s. See `doc/dsl_codegen_perf.md`.
+- **`impl(carry=…)`**: maintained sets can be stored with each state instead of recomputed on decode. The default is off, because measurement showed no gain.
+
 # Changes (7): the embedded DSL, milestone 1
 
 - **`src/kobayashi_pw/dsl/`** (new): an embedded DSL for set-determined layout searches.
