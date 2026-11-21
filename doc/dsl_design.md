@@ -358,6 +358,36 @@ A spec is the IR plus the clause structure (cost, closures, choose, symmetry, ke
 - **Packed keys.** The quotient key S ∩ C needs an index map C → [0, τ). This is a spec constant, lowered as a gather of bits, or as a word-level compress where `pext` is available.
 - **Proof-carrying lemmas.** The lemma hypotheses are checked only to the extent the IR pattern-matcher can check them. Anything beyond that appears in `spec.report()` as an explicit assumption.
 
+### 8.7 The compiler (Python), stage by stage
+
+The language is narrow. There are no user loops, recursion or mutation, only set algebra, comprehensions and a fixed set of clauses, and the search loop is not compiled at all (it is `engine.h`). That keeps the compiler small, about 2–4 k lines of Python for milestone 1.
+
+1. **Front end (tracer).**
+   - Symbolic `Set`, `Int`, `Bool`, `Vertex` and `Seq` objects overload the operators. A hash-consed node table gives common-subexpression elimination for free.
+   - Each lambda is traced with fresh bound variables.
+   - Type checking covers element types, and ensures a `Seq` is used only where order matters.
+2. **Analysis.**
+   - **Dependence:** whether each node depends on S, on the move variable x, on a comprehension variable, or only on the graph. Graph-only nodes are hoisted to run-time constants and precomputed once per solve.
+   - **Lemma hypotheses** are checked by pattern matching on the IR (§8.2).
+3. **Rewriting** (a small term-rewriting system with a terminating, confluent core):
+   - set-algebra simplification;
+   - `card` of a comprehension becomes a counting loop;
+   - `f(S + v) − f(S)` is rewritten to its derivative when f matches a library form.
+4. **Finite differencing for `maintain`.** Every maintained q(S) needs an update q(S + u) = q(S) ⊕ δ(u, S) and, for undo, its inverse. These are derived by rules for ⋃, ∩ with a constant, `card`, and `sum` over S. This is Paige and Koenig's finite differencing of set expressions (TOPLAS 1982), which was developed for SETL and is the classical form of exactly this step. Uses of q are then replaced by reads of the maintained variable.
+5. **Representation selection and lowering.**
+   - A set expression is either *materialised* as `uint64_t[W]` words, or *iterated* as a bit loop or CSR walk, according to its uses and the D annotations.
+   - Comprehensions and quantifiers are fused, so that card({u ∈ A : φ}) and ∃u ∈ A. φ never build a set.
+   - The result is a small imperative IR: loops over bits or CSR, word operations, scalars.
+6. **Emission.** `ops.h` contains `decode`, `for_each_move`, `apply`/`undo`, `key` and `cost`, each `static inline`, with `#line`-style comments pointing back to the spec clause. Debug builds also emit assertion code comparing every maintained value and closed-form cost against direct evaluation.
+7. **Build and cache** (§8.4).
+
+The eager interpreter is just an evaluator for the stage-1 IR on Python ints. It defines the semantics that every later stage must preserve, and `check()` tests that equivalence.
+
+**Prior art the design follows.**
+- **Halide** separates a functional *algorithm* from a *schedule*, which is our P/D split.
+- **TACO** separates tensor-algebra expressions from per-operand *format* annotations, which corresponds to our `repr`/`maintain`.
+- **Kestrel's KIDS/Specware** (D. R. Smith) derived search algorithms from functional specifications by applying algorithm theories, such as global search with dominance and filters, and then data-structure refinement. That is close to what Layer P plus the lemma library does. They also used finite differencing as a standard optimisation step.
+
 ## 9. Decisions
 
 - **Q1 / Q2: settled by §8.** The DSL is embedded in Python and traced to an IR. C is generated, compiled on demand and cached. The generated part is `ops.h`, against a fixed hand-written `engine.h`.
