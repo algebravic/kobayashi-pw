@@ -502,9 +502,18 @@ def generate(prob) -> str:
     probe = p.ann.get("probe", False) and p.key_node is p.S.node and p.move.prefix is None
 
     def b_expand(L):
+        """Moves of one expansion.  Children are offered through a one-deep pipeline:
+        child i's slot is prefetched when its key is built, and child i-1 is offered
+        then, so the offer order (hence states, widths, orderings) is unchanged.  With
+        probe-before-closure, pass 1 filters by cost and prefetches the slots of S + x;
+        pass 2 probes and applies in the same order (doc/memory_hierarchy.md §5)."""
         L.emit("const Consts *K = E->K;")
         L.emit("int next = INT_MAX; u64 T[W], key[W], cand[W]; int nr = 0; (void)nr;")
         L.emit("int pre[64 * W]; (void)pre;")
+        L.emit("u64 pkey[W]; uint64_t ph = 0; int px = -1, pfull = 0, nc = 0; (void)nc;")
+        L.emit("#if DSL_CARRY_WORDS")
+        L.emit("Mt pmt;")
+        L.emit("#endif")
         if inplace:
             # one copy per expansion; moves are applied to (T, mt2) and undone
             L.emit("Mt mt2 = *mt; int rec[64 * W];")
@@ -514,6 +523,35 @@ def generate(prob) -> str:
             L.emit("Mt mt2;")
             L.env[p.S_name] = ("S", "mt")
         hoist(L)
+
+        def offer(full_expr):
+            L.emit("{")
+            L.ind += 1
+            L.emit("uint64_t hh = hkey(key); eng_prefetch(E, hh);")
+            L.emit("if (px >= 0 && eng_offer_h(E, pkey, ph, id, px, pfull, MT_CARRY_PTR(&pmt))) return -1;")
+            L.emit(f"memcpy(pkey, key, sizeof pkey); ph = hh; px = x; pfull = {full_expr};")
+            L.emit("#if DSL_CARRY_WORDS")
+            L.emit("pmt = mt2;")
+            L.emit("#endif")
+            L.ind -= 1
+            L.emit("}")
+
+        def apply_and_offer():
+            if inplace:
+                L.emit("{")
+                L.ind += 1
+                apply_move(L, rec=False, inplace=True)
+                L.emit("make_key(T, key, K);")
+                L.emit("int full = is_full(T, K);")
+                L.emit("for (int k = nr; k-- > 0;) st_del(T, &mt2, rec[k], K);")
+                offer("full")
+                L.ind -= 1
+                L.emit("}")
+            else:
+                apply_move(L, rec=False)
+                L.emit("make_key(T, key, K);")
+                offer("is_full(T, K)")
+
         def body():
             L.env[p.x_name] = "x"
             for f in p.choice_filters:
@@ -527,22 +565,22 @@ def generate(prob) -> str:
             if probe:
                 L.emit("for (int w = 0; w < W; w++) T[w] = S[w];")
                 L.emit("T[x >> 6] |= 1ULL << (x & 63);")
-                L.emit("if (eng_lookup(E, T)) continue;")
-            if inplace:
-                L.emit("{")
-                L.ind += 1
-                apply_move(L, rec=False, inplace=True)
-                L.emit("make_key(T, key, K);")
-                L.emit("int full = is_full(T, K);")
-                L.emit("for (int k = nr; k-- > 0;) st_del(T, &mt2, rec[k], K);")
-                L.emit("if (eng_offer(E, key, id, x, full, MT_CARRY_PTR(&mt2))) return -1;")
-                L.ind -= 1
-                L.emit("}")
+                L.emit("E->cx[nc] = x; E->ch[nc] = hkey(T); eng_prefetch(E, E->ch[nc]); nc++;")
             else:
-                apply_move(L, rec=False)
-                L.emit("make_key(T, key, K);")
-                L.emit("if (eng_offer(E, key, id, x, is_full(T, K), MT_CARRY_PTR(&mt2))) return -1;")
+                apply_and_offer()
         L.foreach(p.move.over_minus_S, "x", body)
+        if probe:
+            L.emit("for (int k = 0; k < nc; k++) {")
+            L.push()
+            L.emit("int x = E->cx[k];")
+            L.env[p.x_name] = "x"
+            L.emit("for (int w = 0; w < W; w++) T[w] = S[w];")
+            L.emit("T[x >> 6] |= 1ULL << (x & 63);")
+            L.emit("if (eng_lookup_h(E, T, E->ch[k])) continue;")
+            apply_and_offer()
+            L.pop()
+            L.emit("}")
+        L.emit("if (px >= 0 && eng_offer_h(E, pkey, ph, id, px, pfull, MT_CARRY_PTR(&pmt))) return -1;")
         L.emit("return next;")
     out += fn("static int expand(Eng *E, uint32_t id, const u64 *S, const Mt *mt, int lo, int B)", b_expand)
 

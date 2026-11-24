@@ -1,4 +1,4 @@
-all: kpw kpw2 kcw kpw2_192 bab kpw2_512 fullcount
+all: kpw kpw2 kcw kpw2_192 bab kpw2_512 fullcount kopt
 
 kpw: kpw.c
 	$(CC) -O3 -march=native -Wall -Wextra -o $@ $<
@@ -20,3 +20,6 @@ bab: bab.c
 
 fullcount: fullcount.c
 	$(CC) -O3 -march=native -Wall -Wextra -o $@ $<
+
+kopt: kopt.c
+	$(CC) -O3 -march=native -Wall -Wextra -o $@ $< -lm

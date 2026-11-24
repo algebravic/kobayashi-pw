@@ -86,3 +86,18 @@ def test_parity_with_kpw_kcw(tmp_path):
         # the same search: identical counts on grids and square-sum graphs; on some random
         # graphs a tie-break difference (not yet identified) changes the count slightly
         assert abs(s.stats["states"] - ref_states) <= 0.1 * ref_states + 2
+
+
+def test_machine_config(tmp_path, monkeypatch):
+    from kobayashi_pw.dsl.jit import machine_config, TABLE_DEFAULTS
+    monkeypatch.delenv("KPW_TABLE_PART_BITS", raising=False)
+    monkeypatch.delenv("KPW_PREFETCH", raising=False)
+    y = tmp_path / "m.yaml"
+    y.write_text("KPW_TABLE_PART_BITS: 3   # comment\nKPW_PREFETCH: 0\n_cpu: test\nSM_OTHER: 5\n")
+    monkeypatch.setenv("KPW_MACHINE_YAML", str(y))
+    assert machine_config() == {"KPW_TABLE_PART_BITS": 3, "KPW_PREFETCH": 0}
+    monkeypatch.setenv("KPW_PREFETCH", "1")                 # environment overrides the file
+    assert machine_config()["KPW_PREFETCH"] == 1
+    monkeypatch.setenv("KPW_MACHINE_YAML", str(tmp_path / "missing.yaml"))
+    monkeypatch.chdir(tmp_path)
+    assert machine_config()["KPW_TABLE_PART_BITS"] in (TABLE_DEFAULTS["KPW_TABLE_PART_BITS"], 3)

@@ -1,3 +1,12 @@
+# Changes (9): state table and the memory hierarchy (tier 1)
+
+- **The state table** in `src/C/dsl_rt.h` and `src/C/kcw.c` is now partitioned open addressing with 32-bit fingerprints. A probe reads the key only on a fingerprint match, and a partition grows on its own by moving slots by fingerprint, so there is no global rehash. `src/C/kpw.c` gets the partitioned growth; its keys are inline, so it needs no fingerprints.
+- **Order-preserving prefetch.** The DSL and kcw offer children one behind, prefetching each child's slot first; the DSL's probe-before-closure runs in two passes; kpw prefetches at push time. Widths, state counts and orderings are unchanged.
+- **Results:** DSL 1.24–1.41× on vertex separation and 1.15–1.25× on cutwidth grids; kcw 1.14–1.17×; kpw within noise. Details are in `doc/memory_hierarchy.md` §6.
+- **Parameters:** `KPW_TABLE_PART_BITS` and `KPW_PREFETCH`, read from `machine.yaml` (see `machine.example.yaml`) or the environment, or given as `-D` flags.
+- **Fixed:** a shift by 64 (undefined behaviour) when `KPW_TABLE_PART_BITS = 0`; the range is now checked to be [0, 16].
+- **`kpw -c`:** the DAG file is canonical; sets of equal size are listed in increasing order.
+
 # Changes (8): Lean formalisation; codegen closure push-down
 
 - **`lean/`** (new): a Lean 4.36 / Mathlib v4.36 formalisation with no `sorry`; the axiom audit shows only `propext`, `Classical.choice` and `Quot.sound`. It proves:

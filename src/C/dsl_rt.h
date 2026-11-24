@@ -41,8 +41,26 @@ static inline int is_full(const u64 *T, const Consts *K) {
     return 1;
 }
 
-/* ---- state table: keys (W words), parent id, label x ---- */
+/* ---- state table: keys (W words), parent id, label x ----
+ * Partitioned open addressing (doc/memory_hierarchy.md §5).  The top PART_BITS
+ * bits of the 64-bit hash pick a partition; a slot holds fp << 32 | (id + 1)
+ * with fp = low 32 bits of the hash; the probe index is fp & mask.  A probe
+ * reads keys[id] only on a fingerprint match, and a partition grows on its
+ * own by moving slots by their fingerprints (keys are never read). */
+#ifndef KPW_TABLE_PART_BITS
+#define KPW_TABLE_PART_BITS 8
+#endif
+#ifndef KPW_PREFETCH
+#define KPW_PREFETCH 1
+#endif
+#if KPW_TABLE_PART_BITS < 0 || KPW_TABLE_PART_BITS > 16
+#error "KPW_TABLE_PART_BITS must be in [0, 16]"
+#endif
+#define NPART (1u << KPW_TABLE_PART_BITS)
+#define PART0 ((65536u >> KPW_TABLE_PART_BITS) < 16u ? 16u : (65536u >> KPW_TABLE_PART_BITS))   /* initial slots per partition */
+
 typedef struct { uint32_t id; int lo; } Item;
+typedef struct { u64 *slot; uint32_t mask, count; } Part;
 
 #ifndef DSL_CARRY_WORDS
 #define DSL_CARRY_WORDS 0
@@ -53,43 +71,73 @@ typedef struct {
     const Consts *K;
     u64 *keys; uint32_t *par; int32_t *lab; size_t ns, cap;
     u64 *cm;                          /* CW words per state, when DSL_CARRY_WORDS > 0 */
-    uint32_t *ht; size_t hmask;
+    Part part[NPART];
     Item *stack; size_t sp, scap;
     Item **bk; size_t *blen, *bcap; int nb;
-    long done;                   /* id of V, or -1 */
+    int *cx; uint64_t *ch;            /* per-expansion candidate buffers (n entries) */
+    long done;                        /* id of V, or -1 */
     int oom;
 } Eng;
 
 static inline uint64_t hkey(const u64 *k) {
     uint64_t h = 0x9E3779B97F4A7C15ULL;
     for (int i = 0; i < W; i++) { h ^= k[i]; h *= 0xBF58476D1CE4E5B9ULL; h ^= h >> 31; }
+    h ^= h >> 29; h *= 0x94D049BB133111EBULL; h ^= h >> 32;
     return h;
 }
+#define HPART(h) ((uint32_t)(((h) >> 1) >> (63 - KPW_TABLE_PART_BITS)))   /* top bits; 0 when PART_BITS = 0 (no shift by 64) */
+#define HFP(h) ((uint32_t)(h))
 
-static int eng_rehash(Eng *E, size_t size) {
-    uint32_t *nt = calloc(size, sizeof *nt);
-    if (!nt) { E->oom = 1; return 0; }
-    free(E->ht); E->ht = nt; E->hmask = size - 1;
-    for (size_t id = 0; id < E->ns; id++) {
-        size_t h = hkey(E->keys + id * W) & E->hmask;
-        while (E->ht[h]) h = (h + 1) & E->hmask;
-        E->ht[h] = (uint32_t)id + 1;
+static inline void eng_prefetch(Eng *E, uint64_t h) {
+#if KPW_PREFETCH
+    Part *P = &E->part[HPART(h)];
+    __builtin_prefetch(&P->slot[HFP(h) & P->mask]);
+#else
+    (void)E; (void)h;
+#endif
+}
+
+static int part_init(Eng *E) {
+    for (unsigned p = 0; p < NPART; p++) {
+        E->part[p].slot = calloc(PART0, sizeof(u64));
+        if (!E->part[p].slot) { E->oom = 1; return 0; }
+        E->part[p].mask = PART0 - 1; E->part[p].count = 0;
     }
     return 1;
 }
 
-static inline long eng_find(Eng *E, const u64 *key, size_t *slot) {
-    size_t h = hkey(key) & E->hmask;
-    while (E->ht[h]) {
-        uint32_t id = E->ht[h] - 1;
-        if (!memcmp(E->keys + (size_t)id * W, key, W * sizeof(u64))) { if (slot) *slot = h; return id; }
-        h = (h + 1) & E->hmask;
+static int part_grow(Eng *E, Part *P) {
+    uint32_t nsz = 2 * (P->mask + 1), nm = nsz - 1;
+    u64 *ns = calloc(nsz, sizeof(u64));
+    if (!ns) { E->oom = 1; return 0; }
+    for (uint32_t i = 0; i <= P->mask; i++) {
+        u64 v = P->slot[i];
+        if (!v) continue;
+        uint32_t j = (uint32_t)(v >> 32) & nm;
+        while (ns[j]) j = (j + 1) & nm;
+        ns[j] = v;
     }
-    if (slot) *slot = h;
-    return -1;
+    free(P->slot); P->slot = ns; P->mask = nm;
+    return 1;
 }
 
-static inline int eng_lookup(Eng *E, const u64 *key) { return eng_find(E, key, NULL) >= 0; }
+/* id of key, or -1; *slot gets the free slot index on a miss */
+static inline long eng_find_h(Eng *E, const u64 *key, uint64_t h, uint32_t *slot) {
+    Part *P = &E->part[HPART(h)];
+    uint32_t fp = HFP(h), i = fp & P->mask;
+    for (;;) {
+        u64 v = P->slot[i];
+        if (!v) { if (slot) *slot = i; return -1; }
+        if ((uint32_t)(v >> 32) == fp) {
+            uint32_t id = (uint32_t)v - 1;
+            if (!memcmp(E->keys + (size_t)id * W, key, W * sizeof(u64))) return id;
+        }
+        i = (i + 1) & P->mask;
+    }
+}
+
+static inline int eng_lookup_h(Eng *E, const u64 *key, uint64_t h) { return eng_find_h(E, key, h, NULL) >= 0; }
+static inline int eng_lookup(Eng *E, const u64 *key) { return eng_lookup_h(E, key, hkey(key)); }
 
 static inline void eng_push(Eng *E, uint32_t id, int lo) {
     if (E->sp == E->scap) {
@@ -101,9 +149,9 @@ static inline void eng_push(Eng *E, uint32_t id, int lo) {
     E->stack[E->sp].id = id; E->stack[E->sp].lo = lo; E->sp++;
 }
 
-static long eng_insert(Eng *E, const u64 *key, uint32_t parent, int x, const u64 *cm) {   /* new id, or -1 */
-    size_t slot;
-    if (eng_find(E, key, &slot) >= 0) return -1;
+static long eng_insert_h(Eng *E, const u64 *key, uint64_t h, uint32_t parent, int x, const u64 *cm) {
+    uint32_t slot;
+    if (eng_find_h(E, key, h, &slot) >= 0) return -1;
     if (E->ns == E->cap) {
         size_t nc = E->cap ? 2 * E->cap : 1 << 16;
         u64 *k = realloc(E->keys, nc * W * sizeof(u64));
@@ -117,6 +165,7 @@ static long eng_insert(Eng *E, const u64 *key, uint32_t parent, int x, const u64
         E->cm = c;
 #endif
     }
+    if (E->ns >= 0xFFFFFFFFu) { E->oom = 1; return -1; }
     uint32_t id = (uint32_t)E->ns++;
     memcpy(E->keys + (size_t)id * W, key, W * sizeof(u64));
     E->par[id] = parent; E->lab[id] = x;
@@ -125,12 +174,25 @@ static long eng_insert(Eng *E, const u64 *key, uint32_t parent, int x, const u64
 #else
     (void)cm;
 #endif
-    E->ht[slot] = id + 1;
-    if (2 * E->ns > E->hmask + 1) eng_rehash(E, 2 * (E->hmask + 1));
+    Part *P = &E->part[HPART(h)];
+    P->slot[slot] = ((u64)HFP(h) << 32) | (u64)(id + 1);
+    if (2 * (size_t)++P->count > (size_t)P->mask + 1) part_grow(E, P);
     return id;
 }
 
+static long eng_insert(Eng *E, const u64 *key, uint32_t parent, int x, const u64 *cm) {
+    return eng_insert_h(E, key, hkey(key), parent, x, cm);
+}
+
 /* called by generated expand(): returns 1 when V has been reached */
+static inline int eng_offer_h(Eng *E, const u64 *key, uint64_t h, uint32_t parent, int x, int full, const u64 *cm) {
+    long id = eng_insert_h(E, key, h, parent, x, cm);
+    if (id < 0) return 0;
+    if (full) { E->done = id; return 1; }
+    eng_push(E, (uint32_t)id, -1);
+    return 0;
+}
+
 static inline int eng_offer(Eng *E, const u64 *key, uint32_t parent, int x, int full, const u64 *cm) {
     long id = eng_insert(E, key, parent, x, cm);
     if (id < 0) return 0;

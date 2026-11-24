@@ -50,26 +50,57 @@ static void push(Vec *v, const void *e) {
  * key == 0 marks an empty slot; key = S+1.  The full set V is never stored
  * (it would overflow when n = 64); its parent link is kept in fullpar/fullx. */
 typedef struct { u64 key, par; int x; int good; } Slot;
-static Slot *tab; static size_t tcap, tlen;
-static inline size_t hsh(u64 k) { k ^= k >> 33; k *= 0xff51afd7ed558ccdULL; k ^= k >> 33; return (size_t)k; }
-static void rehash(void);
-static Slot *find(u64 S) {
-    u64 k = S + 1; size_t i = hsh(k) & (tcap - 1);
-    while (tab[i].key && tab[i].key != k) i = (i + 1) & (tcap - 1);
-    return &tab[i];
+/* Partitioned open addressing (doc/memory_hierarchy.md §5): the top
+ * KPW_TABLE_PART_BITS bits of the hash pick a partition, which grows on its own
+ * (no global rehash, no 1.5x peak).  Keys are inline, so no fingerprints. */
+#ifndef KPW_TABLE_PART_BITS
+#define KPW_TABLE_PART_BITS 8
+#endif
+#ifndef KPW_PREFETCH
+#define KPW_PREFETCH 1
+#endif
+#if KPW_TABLE_PART_BITS < 0 || KPW_TABLE_PART_BITS > 16
+#error "KPW_TABLE_PART_BITS must be in [0, 16]"
+#endif
+#define NPART (1u << KPW_TABLE_PART_BITS)
+#define PART0 ((65536u >> KPW_TABLE_PART_BITS) < 16u ? 16u : (65536u >> KPW_TABLE_PART_BITS))   /* initial slots per partition */
+typedef struct { Slot *s; size_t mask, len; } Part;
+static Part part[NPART]; static size_t tlen;
+static inline uint64_t hsh(u64 k) { k ^= k >> 33; k *= 0xff51afd7ed558ccdULL; k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53ULL; k ^= k >> 33; return k; }
+#define HPART(h) ((uint32_t)(((h) >> 1) >> (63 - KPW_TABLE_PART_BITS)))   /* top bits; 0 when PART_BITS = 0 (no shift by 64) */
+static inline Slot *find_in(Part *P, u64 k, uint64_t h) {
+    size_t i = h & P->mask;
+    while (P->s[i].key && P->s[i].key != k) i = (i + 1) & P->mask;
+    return &P->s[i];
+}
+static Slot *find(u64 S) { u64 k = S + 1; uint64_t h = hsh(k); return find_in(&part[HPART(h)], k, h); }
+static inline void prefetch_set(u64 S) {
+#if KPW_PREFETCH
+    u64 k = S + 1; uint64_t h = hsh(k); Part *P = &part[HPART(h)];
+    __builtin_prefetch(&P->s[h & P->mask]);
+#else
+    (void)S;
+#endif
+}
+static void part_grow(Part *P) {
+    Part Q = { calloc(2 * (P->mask + 1), sizeof(Slot)), 2 * (P->mask + 1) - 1, P->len };
+    if (!Q.s) { fprintf(stderr, "out of memory\n"); exit(3); }
+    for (size_t i = 0; i <= P->mask; i++) if (P->s[i].key) *find_in(&Q, P->s[i].key, hsh(P->s[i].key)) = P->s[i];
+    free(P->s); *P = Q;
 }
 static int insert(u64 S, u64 par, int x) {      /* 1 if new */
-    if (2 * (tlen + 1) > tcap) rehash();
-    Slot *s = find(S);
+    u64 k = S + 1; uint64_t h = hsh(k); Part *P = &part[HPART(h)];
+    Slot *s = find_in(P, k, h);
     if (s->key) return 0;
-    s->key = S + 1; s->par = par; s->x = x; s->good = 0; tlen++; return 1;
+    s->key = k; s->par = par; s->x = x; s->good = 0; tlen++;
+    if (2 * ++P->len > P->mask + 1) part_grow(P);
+    return 1;
 }
-static void rehash(void) {
-    Slot *old = tab; size_t oc = tcap;
-    tcap = oc ? 2 * oc : 1 << 16; tab = calloc(tcap, sizeof(Slot)); tlen = 0;
-    if (!tab) { fprintf(stderr, "out of memory\n"); exit(3); }
-    for (size_t i = 0; i < oc; i++) if (old[i].key) { Slot *s = find(old[i].key - 1); *s = old[i]; tlen++; }
-    free(old);
+static void table_init(void) {
+    for (unsigned p = 0; p < NPART; p++) {
+        part[p].s = calloc(PART0, sizeof(Slot)); part[p].mask = PART0 - 1; part[p].len = 0;
+        if (!part[p].s) { fprintf(stderr, "out of memory\n"); exit(3); }
+    }
 }
 
 /* ---------- expansion ----------
@@ -116,7 +147,7 @@ static void scan(u64 S, u64 nb, int lo, int c) {
     for (u64 m = full & ~S; m; m &= m - 1) {
         int x = __builtin_ctzll(m);
         int w = __builtin_popcountll((nb | nin[x]) & ~(S | (1ULL << x)));
-        if (w <= c) { if (w > lo) { Pair p = {S, nb, x}; push(&stack, &p); } }
+        if (w <= c) { if (w > lo) { Pair p = {S, nb, x}; push(&stack, &p); prefetch_set(S | (1ULL << x)); } }
         else if (w < nxt) nxt = w;
     }
     if (nxt <= n) { Ent e = {S, nb}; push(&buckets[nxt], &e); }
@@ -126,13 +157,16 @@ static u64 unionnin(u64 U) { u64 r = 0; for (; U; U &= U - 1) r |= nin[__builtin
 
 /* ---------- complete mode: backward co-reachability ---------- */
 static int cmp_pop_desc(const void *a, const void *b) {
-    int pa = __builtin_popcountll(*(const u64 *)a), pb = __builtin_popcountll(*(const u64 *)b);
-    return pb - pa;
+    u64 x = *(const u64 *)a, y = *(const u64 *)b;
+    int pa = __builtin_popcountll(x), pb = __builtin_popcountll(y);
+    if (pa != pb) return pb - pa;
+    return (x > y) - (x < y);          /* tie-break: the DAG file no longer depends on table layout */
 }
 static u64 *dagsets; static size_t ndag;
 static void prune(int pw) {
     u64 *all = malloc((tlen ? tlen : 1) * sizeof(u64)); size_t m = 0;
-    for (size_t i = 0; i < tcap; i++) if (tab[i].key) all[m++] = tab[i].key - 1;
+    for (unsigned p = 0; p < NPART; p++)
+        for (size_t i = 0; i <= part[p].mask; i++) if (part[p].s[i].key) all[m++] = part[p].s[i].key - 1;
     qsort(all, m, sizeof(u64), cmp_pop_desc);
     dagsets = malloc((m + 1) * sizeof(u64)); ndag = 0;
     for (size_t i = 0; i < m; i++) {
@@ -189,7 +223,7 @@ int main(int argc, char **argv) {
     }
     for (int i = 0; i < 66; i++) buckets[i].sz = sizeof(Ent);
     full = n == 64 ? ~0ULL : (1ULL << n) - 1;
-    rehash();
+    table_init();
 
     u64 S0 = 0, nb0 = 0; expand(&S0, &nb0, NULL);
     if (S0 == full) fullx = -1; else insert(S0, ~0ULL, -1);

@@ -17,6 +17,7 @@ src/C/kpw2 -q -t 0 data/sq75.txt                  # n up to 128, all cores
 src/C/kpw2 -q -x data/sq75.txt                    # compact table: store only the arc label
 src/C/kpw -c -o sq63.dag data/sq63.txt            # complete mode: DAG of all relevant pw-optimal orderings
 uv run kobayashi-pw-orders data/sq63.txt          # exact V7 optimum over that DAG (frontier-DP order)
+src/C/kopt -m v7 sq63.dag                         # the same optimum in C (also -m v2, -m loglin -B ...)
 uv run kobayashi-pw-orders data/sq63.txt --cost v2 --k 5 --sample 10
 uv run pytest -q
 ```
@@ -87,6 +88,34 @@ Each can be turned off: `-C` turns off the cover restriction and `-W` turns off 
 A C translation of SageMath's `vertex_separation_BAB` (Cython, by David Coudert), kept for comparison. It makes the same branching and pruning decisions as Sage: on 463 test cases it gives the same width, the same sequence of improved upper bounds, the same stored-prefix count and the same ordering (`bench/bab_parity.py`, needs Sage). Any n is accepted. Flags: `-d` directed, `-k CUT_OFF`, `-u UPPER_BOUND`, `-l MAX_PREFIX_LENGTH` (default 20), `-m MAX_PREFIX_NUMBER` (default 10^6), `-r`, `-q`, `-v`. Its boundary uses out-neighbours (Sage's convention); it has the same width as kpw's in-neighbour boundary. Timings are in `doc/bab_port.md`.
 
 **Licence:** `bab.c` is derived from GPL-2+ Sage code and is itself GPL-2-or-later; see its header.
+
+### kopt (`src/C/kopt.c`): exact secondary-cost optimisation in C
+
+`kopt -m MODEL [-b C] [-a A] [-B b0,...,b10] [-L max_labels] [-q] DAGFILE` reads a DAG written by `kpw -c -o` or `kpw2 -c -o` and runs the same Pareto-label DP as `orders.optimize`:
+- the arcs are recomputed with the same expansion order, so the blocks are the same;
+- the step features are those of `orders.tau_block_features`;
+- ties break as in Python's stable sort.
+
+Models:
+- `v2`;
+- `v7`, with `-b` expand_base and `-a` density_alpha;
+- `loglin`, the predicted-work model `make_model_loglin`: a = 0, e = 2^nb, k = exp(β·x)/2^nb, with x = `WORK_FEATURES` and the 11 coefficients given by `-B`.
+
+`-L` keeps at most that many labels per node; the output then reports `exact=0`. The ordering is printed in the frontier-DP direction, with the file's vertex names.
+
+From Python, call `orders.optimize_file(path, cost, beta=..., ...)`. The build is `make kopt`, needs `-lm`, and handles n ≤ 128 by default (`-DW=k` for n ≤ 64k).
+
+Agreement with `optimize` is tested (`tests/test_kopt.py`): the same cost to 1e-9, and equality with brute-force path enumeration on random graphs, with and without `-g`. On the square-sum graphs the orderings are identical to Python's.
+
+Timings and memory (2-core container):
+
+| n | nodes | arcs | v7 | loglin (labels; peak RSS) |
+|---|---|---|---|---|
+| 57 | 13 762 | 86 555 | 0.11 s | 0.30 s (0.70 M labels; 19 MB) |
+| 61 | 263 672 | 2.17 M | 3.3 s | 14.1 s (23.0 M labels; 616 MB) |
+| 75 | 132 400 | 1.08 M | 1.7 s | 8.4 s (14.4 M labels; 411 MB) |
+
+The Python `optimize` takes 15.5 s at n = 57 for `loglin`, and several minutes at n = 59–61. A label takes 24 bytes. All fronts are kept for the traceback, so memory grows with the total number of labels.
 
 ### kpw2 (`src/C/kpw2.c`)
 

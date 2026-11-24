@@ -62,7 +62,26 @@ static int nwN;                         /* words of an n-bit set */
 
 static u64 *keys; static uint32_t *par; static int32_t *sx, *si;
 static size_t ns, scap;
-static uint32_t *ht; static size_t hmask;
+/* state table: partitioned open addressing with fingerprints
+ * (doc/memory_hierarchy.md §5): the top KPW_TABLE_PART_BITS bits of the hash
+ * pick a partition; a slot holds fp << 32 | (id + 1), fp = low 32 bits of the
+ * hash, probe index fp & mask; keys[] is read only on a fingerprint match; a
+ * partition grows on its own by moving slots by fingerprint. */
+#ifndef KPW_TABLE_PART_BITS
+#define KPW_TABLE_PART_BITS 8
+#endif
+#ifndef KPW_PREFETCH
+#define KPW_PREFETCH 1
+#endif
+#if KPW_TABLE_PART_BITS < 0 || KPW_TABLE_PART_BITS > 16
+#error "KPW_TABLE_PART_BITS must be in [0, 16]"
+#endif
+#define NPART (1u << KPW_TABLE_PART_BITS)
+#define PART0 ((65536u >> KPW_TABLE_PART_BITS) < 16u ? 16u : (65536u >> KPW_TABLE_PART_BITS))   /* initial slots per partition */
+typedef struct { u64 *slot; uint32_t mask, count; } Part;
+static Part part[NPART];
+#define HPART(h) ((uint32_t)(((h) >> 1) >> (63 - KPW_TABLE_PART_BITS)))   /* top bits; 0 when PART_BITS = 0 (no shift by 64) */
+#define HFP(h) ((uint32_t)(h))
 
 static uint32_t *stack; static size_t sp, stcap;
 typedef struct { uint32_t *v; size_t len, cap; } Vec;
@@ -94,27 +113,55 @@ static void spush(uint32_t x) {
 static inline uint64_t hkey(const u64 *k) {
     uint64_t h = 0x9E3779B97F4A7C15ULL;
     for (int i = 0; i < kw; i++) { h ^= k[i]; h *= 0xBF58476D1CE4E5B9ULL; h ^= h >> 31; }
+    h ^= h >> 29; h *= 0x94D049BB133111EBULL; h ^= h >> 32;
     return h;
 }
 
-static void rehash(size_t newsize) {
-    free(ht);
-    ht = calloc(newsize, sizeof *ht); hmask = newsize - 1;
-    if (!ht) { fprintf(stderr, "out of memory (hash)\n"); exit(3); }
-    for (size_t id = 0; id < ns; id++) {
-        size_t h = hkey(keys + id * kw) & hmask;
-        while (ht[h]) h = (h + 1) & hmask;
-        ht[h] = (uint32_t)id + 1;
+static void table_init(void) {
+    for (unsigned p = 0; p < NPART; p++) {
+        part[p].slot = calloc(PART0, sizeof(u64)); part[p].mask = PART0 - 1; part[p].count = 0;
+        if (!part[p].slot) { fprintf(stderr, "out of memory (hash)\n"); exit(3); }
     }
 }
 
+static void table_free(void) {
+    for (unsigned p = 0; p < NPART; p++) { free(part[p].slot); part[p].slot = NULL; }
+}
+
+static void part_grow(Part *P) {
+    uint32_t nsz = 2 * (P->mask + 1), nm = nsz - 1;
+    u64 *nt = calloc(nsz, sizeof(u64));
+    if (!nt) { fprintf(stderr, "out of memory (hash)\n"); exit(3); }
+    for (uint32_t i = 0; i <= P->mask; i++) {
+        u64 v = P->slot[i];
+        if (!v) continue;
+        uint32_t j = (uint32_t)(v >> 32) & nm;
+        while (nt[j]) j = (j + 1) & nm;
+        nt[j] = v;
+    }
+    free(P->slot); P->slot = nt; P->mask = nm;
+}
+
+static inline void prefetch_h(uint64_t h) {
+#if KPW_PREFETCH
+    Part *P = &part[HPART(h)];
+    __builtin_prefetch(&P->slot[HFP(h) & P->mask]);
+#else
+    (void)h;
+#endif
+}
+
 /* returns id; *isnew set if inserted */
-static uint32_t insert(const u64 *k, uint32_t p, int x, int i, int *isnew) {
-    size_t h = hkey(k) & hmask;
-    while (ht[h]) {
-        uint32_t id = ht[h] - 1;
-        if (!memcmp(keys + (size_t)id * kw, k, kw * sizeof(u64))) { *isnew = 0; return id; }
-        h = (h + 1) & hmask;
+static uint32_t insert_h(const u64 *k, uint64_t hh, uint32_t p, int x, int i, int *isnew) {
+    Part *P = &part[HPART(hh)];
+    uint32_t fp = HFP(hh), h = fp & P->mask;
+    while (P->slot[h]) {
+        u64 v = P->slot[h];
+        if ((uint32_t)(v >> 32) == fp) {
+            uint32_t id = (uint32_t)v - 1;
+            if (!memcmp(keys + (size_t)id * kw, k, kw * sizeof(u64))) { *isnew = 0; return id; }
+        }
+        h = (h + 1) & P->mask;
     }
     if (ns == scap) {
         scap = scap ? 2 * scap : 1 << 16;
@@ -125,10 +172,14 @@ static uint32_t insert(const u64 *k, uint32_t p, int x, int i, int *isnew) {
     uint32_t id = (uint32_t)ns++;
     memcpy(keys + (size_t)id * kw, k, kw * sizeof(u64));
     par[id] = p; sx[id] = x; si[id] = i;
-    ht[h] = id + 1;
-    if (2 * ns > hmask + 1) rehash(2 * (hmask + 1));
+    P->slot[h] = ((u64)fp << 32) | (u64)(id + 1);
+    if (2 * (size_t)++P->count > (size_t)P->mask + 1) part_grow(P);
     *isnew = 1;
     return id;
+}
+
+static uint32_t insert(const u64 *k, uint32_t p, int x, int i, int *isnew) {
+    return insert_h(k, hkey(k), p, x, i, isnew);
 }
 
 static inline int rank_(int v) { return G.deg[v] - 2 * a[v]; }
@@ -287,10 +338,25 @@ static inline int twin_blocked(int x) {
 
 static int done_id = -1;
 
+static u64 *pkey;          /* pending child (one-deep offer pipeline) */
+
+/* offer the pending child; returns 1 when V was inserted */
+static inline int offer_pending(uint32_t id, uint64_t ph, int px, int pi, int pfull) {
+    int isnew;
+    uint32_t cid = insert_h(pkey, ph, id, px, pi, &isnew);
+    if (isnew) {
+        if (pfull) { done_id = (int)cid; return 1; }
+        spush(cid);
+    }
+    return 0;
+}
+
 static void expand(uint32_t id, int B) {
     decode(id);
     expansions++;
     int c = cutS, minw = INT32_MAX;
+    uint64_t ph = 0; int px = -1, pi = 0, pfull = 0;    /* children are offered one behind,
+                                                           after prefetching their slot */
     for (int x = 0; x < G.n; x++) {
         if (IN(inS, x) || (!opt_nocover && !incov[x]) || twin_blocked(x)) continue;
         int dx = rank_(x);
@@ -300,14 +366,14 @@ static void expand(uint32_t id, int B) {
         if (w > B) { if (w < minw) minw = w; continue; }
         apply_child(x, i);
         make_key(keybuf);
-        int full = sizeS == G.n, isnew;
+        int full = sizeS == G.n;
         undo();
-        uint32_t cid = insert(keybuf, id, x, i, &isnew);
-        if (isnew) {
-            if (full) { done_id = (int)cid; return; }
-            spush(cid);
-        }
+        uint64_t hh = hkey(keybuf);
+        prefetch_h(hh);
+        if (px >= 0 && offer_pending(id, ph, px, pi, pfull)) return;
+        memcpy(pkey, keybuf, kw * sizeof(u64)); ph = hh; px = x; pi = i; pfull = full;
     }
+    if (px >= 0 && offer_pending(id, ph, px, pi, pfull)) return;
     if (minw != INT32_MAX) {
         if (minw >= nbuckets) { fprintf(stderr, "internal: bucket overflow\n"); exit(4); }
         vpush(&bucket[minw], id);
@@ -392,7 +458,7 @@ static int solve(int *order, int *lb, size_t *states_out) {
     added = malloc((n + 1) * sizeof(int)); Ybuf = malloc((n + 1) * sizeof(int));
     keybuf = calloc(kw, sizeof(u64));
     ns = 0; scap = 0; keys = NULL; par = NULL; sx = NULL; si = NULL;
-    ht = NULL; rehash(1 << 16);
+    table_init(); pkey = calloc(kw, sizeof(u64));
     sp = 0;
     nbuckets = G.m + 2;
     bucket = calloc(nbuckets, sizeof(Vec));
@@ -457,7 +523,7 @@ out:
     if (result < 0) *lb = B;
     *states_out = ns;
     for (int b = 0; b < nbuckets; b++) free(bucket[b].v);
-    free(bucket); free(keys); free(par); free(sx); free(si); free(ht); ht = NULL;
+    free(bucket); free(keys); free(par); free(sx); free(si); table_free(); free(pkey);
     free(a); free(inS); free(queued); free(qbuf); free(added); free(Ybuf); free(keybuf);
     free(incov); free(cidx); free(cov); free(tw_cls); free(tw_start); free(tw_mem);
     return result;

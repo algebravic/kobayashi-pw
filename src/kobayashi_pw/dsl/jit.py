@@ -16,7 +16,7 @@ import subprocess
 import threading
 from pathlib import Path
 
-ENGINE_VERSION = "2"
+ENGINE_VERSION = "3"
 W_BUCKETS = (1, 2, 3, 4, 5, 6, 8, 11, 16, 24, 32)
 CFLAGS = ["-O3", "-march=native", "-shared", "-fPIC"]
 DEBUG_CFLAGS = ["-O1", "-g", "-shared", "-fPIC", "-fsanitize=undefined"]
@@ -31,6 +31,32 @@ def c_dir() -> Path:
 
 def cache_dir() -> Path:
     return Path(os.environ.get("KPW_CACHE", Path.home() / ".cache" / "kobayashi_pw"))
+
+
+TABLE_DEFAULTS = {"KPW_TABLE_PART_BITS": 8, "KPW_PREFETCH": 1}
+
+
+def machine_config() -> dict:
+    """Table parameters from machine.yaml, in the flat `KEY: value` format of the
+    hamiltonian repo (keys starting with `_` are descriptive, e.g. `_l2_kb`).
+    Lookup: $KPW_MACHINE_YAML, ./machine.yaml, then the repository root.
+    Environment variables of the same names override the file."""
+    cands = [os.environ.get("KPW_MACHINE_YAML"), Path.cwd() / "machine.yaml",
+             Path(__file__).resolve().parents[3] / "machine.yaml"]
+    cfg = dict(TABLE_DEFAULTS)
+    for c in cands:
+        if c and Path(c).is_file():
+            for line in Path(c).read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if ":" in line:
+                    k, v = (t.strip() for t in line.split(":", 1))
+                    if k in cfg:
+                        cfg[k] = int(v)
+            break
+    for k in cfg:
+        if os.environ.get(k):
+            cfg[k] = int(os.environ[k])
+    return cfg
 
 
 def compiler() -> str | None:
@@ -91,7 +117,8 @@ def build(ops_src: str, W: int, debug: bool = False) -> ctypes.CDLL:
     flags = DEBUG_CFLAGS if debug else CFLAGS
     pre = "\n".join(l for l in ops_src.splitlines() if l.startswith("#define DSL_"))
     body = "\n".join(l for l in ops_src.splitlines() if not l.startswith("#define DSL_"))
-    src = f"#define W {W}\n{pre}\n#include \"dsl_rt.h\"\n{body}\n#include \"dsl_engine.h\"\n"
+    tdefs = "\n".join(f"#define {k} {v}" for k, v in sorted(machine_config().items()))
+    src = f"#define W {W}\n{tdefs}\n{pre}\n#include \"dsl_rt.h\"\n{body}\n#include \"dsl_engine.h\"\n"
     h = hashlib.sha256("\0".join([ENGINE_VERSION, src, rt, eng, _ident(cc), " ".join(flags)]).encode()).hexdigest()[:24]
     with _lock:
         if h in _loaded:

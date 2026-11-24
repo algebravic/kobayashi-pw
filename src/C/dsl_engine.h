@@ -49,7 +49,8 @@ int dsl_solve(const Consts *K, const Params *P, Result *R) {
     E.K = K; E.done = -1;
     dsl_stop_flag = 0;
     double t0 = now_s();
-    if (!eng_rehash(&E, 1 << 16)) { R->status = 3; return 3; }
+    if (!part_init(&E)) { R->status = 3; return 3; }
+    E.cx = malloc((K->n + 1) * sizeof(int)); E.ch = malloc((K->n + 1) * sizeof(uint64_t));
     int n = K->n;
     int *rec = malloc((n + 1) * sizeof(int)), nrec = 0;
     u64 S[W], key[W], cand[W]; Mt mt;
@@ -108,7 +109,8 @@ out:
     R->states = (double)E.ns;
     R->expansions = expansions;
     R->seconds = now_s() - t0;
-    free(rec); free(E.keys); free(E.par); free(E.lab); free(E.cm); free(E.ht); free(E.stack);
+    free(rec); free(E.keys); free(E.par); free(E.lab); free(E.cm); free(E.stack); free(E.cx); free(E.ch);
+    for (unsigned p = 0; p < NPART; p++) free(E.part[p].slot);
     for (int i = 0; i < E.nb; i++) free(E.bk[i]);
     free(E.bk); free(E.blen); free(E.bcap);
     return status;

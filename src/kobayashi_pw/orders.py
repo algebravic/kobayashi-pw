@@ -316,6 +316,35 @@ def make_model_v7(expand_base: float = 1.55, density_alpha: float = 0.25) -> Mod
 model_v7 = make_model_v7()
 
 
+# The step features of the hampath work model (hamiltonian/claude/work_model.py):
+# log(states_out / states_in) is predicted as beta . work_features(f, n).
+WORK_FEATURES = ["const", "n_back", "n_elim", "fw", "fw_before", "e_bag",
+                 "log_bell_components", "n_back*fw", "n_elim*fw_before",
+                 "n_back^2", "step/(n-1)"]
+
+
+def work_features(f: StepFeatures, n: int) -> list[float]:
+    """Values of WORK_FEATURES for one tau step of an n-vertex graph."""
+    log_bell = sum(math.log(BELL[min(s, len(BELL) - 1)]) for s in f.comp_sizes)
+    return [1.0, f.n_back, f.n_elim, f.fw, f.fw_before, f.e_bag, log_bell,
+            f.n_back * f.fw, f.n_elim * f.fw_before, f.n_back ** 2,
+            f.step / max(n - 1, 1)]
+
+
+def make_model_loglin(beta: Sequence[float], n: int) -> Model:
+    """Predicted DP work sum_t s_t 2^nb_t with s_{t+1} = s_t exp(beta . x_t):
+    a = 0, e = 2^nb, k = exp(beta . x) / 2^nb.  Exact over the DAG (e >= 0)."""
+    beta = [float(b) for b in beta]
+    if len(beta) != len(WORK_FEATURES):
+        raise ValueError(f"need {len(WORK_FEATURES)} coefficients")
+
+    def model(f: StepFeatures, pw: int) -> tuple[float, float, float]:
+        g = sum(b * x for b, x in zip(beta, work_features(f, n)))
+        e = 2.0 ** f.n_back
+        return 0.0, e, math.exp(g) / e
+    return model
+
+
 def evaluate(g: Graph, tau: Sequence[Hashable], model: Model, pw: int) -> float:
     """Cost of a full ordering tau under ``model`` (same recursion as optimize)."""
     cost, p = 0.0, 1.0
@@ -402,6 +431,67 @@ def optimize(dag: OrderDAG, model: Model, max_labels: int | None = None) -> OptR
         best = best.prev
     tau_idx = [v for blk in blocks[::-1] for v in blk]
     return OptResult(best_c, [g.labels[v] for v in tau_idx], biggest, exact)
+
+
+# ---------------------------------------------------------------------------
+# The same optimisation in C (src/C/kopt.c), on a DAG file
+# ---------------------------------------------------------------------------
+
+def find_kopt(explicit: str | None = None) -> str | None:
+    """kopt: explicit path, then src/C next to this package, then PATH."""
+    import os
+    import shutil
+    if explicit:
+        return explicit
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "..", "C", "kopt"), shutil.which("kopt")):
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return os.path.abspath(cand)
+    return None
+
+
+def optimize_file(path: str, cost: str, *, beta: Sequence[float] | None = None,
+                  expand_base: float = 1.55, density_alpha: float = 0.25,
+                  max_labels: int | None = None, kopt: str | None = None) -> OptResult:
+    """``optimize`` in C on a DAG file written by kpw/kpw2 -c -o.
+
+    cost: "v2", "v7" (with expand_base, density_alpha) or "loglin" (with the
+    11 coefficients ``beta`` of WORK_FEATURES).  Same recursion, arcs, blocks
+    and tie-breaking as ``optimize``; the tau labels come from the file's
+    vertex names (ints if they are all integers)."""
+    import subprocess
+    exe = find_kopt(kopt)
+    if exe is None:
+        raise FileNotFoundError("kopt not built (make -C src/C kopt)")
+    cmd = [exe, "-m", cost]
+    if cost == "v7":
+        cmd += ["-b", repr(float(expand_base)), "-a", repr(float(density_alpha))]
+    elif cost == "loglin":
+        if beta is None or len(beta) != len(WORK_FEATURES):
+            raise ValueError(f"loglin needs {len(WORK_FEATURES)} coefficients")
+        cmd += ["-B", ",".join(repr(float(b)) for b in beta)]
+    elif cost != "v2":
+        raise ValueError(f"unknown cost {cost!r}")
+    if max_labels is not None:
+        cmd += ["-L", str(int(max_labels))]
+    r = subprocess.run(cmd + [path], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"kopt failed: {r.stderr.strip()}")
+    return _parse_kopt(r.stdout)
+
+
+def _parse_kopt(out: str) -> OptResult:
+    head = order = None
+    for line in out.splitlines():
+        if line.startswith("kopt:"):
+            head = dict(t.split("=", 1) for t in line.split()[1:])
+        elif line.startswith("order:"):
+            order = line.split()[1:]
+    if head is None or order is None:
+        raise RuntimeError(f"unexpected kopt output: {out[:200]!r}")
+    if all(_INT.fullmatch(t) for t in order) and len({int(t) for t in order}) == len(order):
+        order = [int(t) for t in order]
+    return OptResult(float(head["cost"]), order, int(head["max_labels"]), head["exact"] == "1")
 
 
 def k_best(dag: OrderDAG, model: Model, k: int) -> list[tuple[float, list[Hashable]]]:
