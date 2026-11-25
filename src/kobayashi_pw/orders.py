@@ -36,6 +36,7 @@ exact.
 from __future__ import annotations
 
 import math
+import os
 import random
 import struct
 from dataclasses import dataclass, field
@@ -437,17 +438,18 @@ def optimize(dag: OrderDAG, model: Model, max_labels: int | None = None) -> OptR
 # The same optimisation in C (src/C/kopt.c), on a DAG file
 # ---------------------------------------------------------------------------
 
-def find_kopt(explicit: str | None = None) -> str | None:
-    """kopt: explicit path, then src/C next to this package, then PATH."""
-    import os
-    import shutil
-    if explicit:
-        return explicit
-    here = os.path.dirname(os.path.abspath(__file__))
-    for cand in (os.path.join(here, "..", "C", "kopt"), shutil.which("kopt")):
-        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
-            return os.path.abspath(cand)
-    return None
+def find_kopt(explicit: str | None = None, n: int | None = None) -> str | None:
+    """kopt for n vertices, compiled on first use (native.py); None if it cannot be built."""
+    from .native import try_program
+    return try_program("kopt", n, explicit=explicit)
+
+
+def _dag_n(path: str) -> int:
+    with open(path, "rb") as f:
+        if f.read(6) != b"KPWDAG":
+            raise RuntimeError(f"{path}: not a kpw DAG file")
+        f.read(2)
+        return struct.unpack("<i", f.read(4))[0]
 
 
 def optimize_file(path: str, cost: str, *, beta: Sequence[float] | None = None,
@@ -460,9 +462,11 @@ def optimize_file(path: str, cost: str, *, beta: Sequence[float] | None = None,
     and tie-breaking as ``optimize``; the tau labels come from the file's
     vertex names (ints if they are all integers)."""
     import subprocess
-    exe = find_kopt(kopt)
+    if not os.path.isfile(path):
+        raise RuntimeError(f"kopt failed: no such DAG file {path}")
+    exe = find_kopt(kopt, _dag_n(path))
     if exe is None:
-        raise FileNotFoundError("kopt not built (make -C src/C kopt)")
+        raise FileNotFoundError("kopt unavailable: no C compiler or sources (see native.py)")
     cmd = [exe, "-m", cost]
     if cost == "v7":
         cmd += ["-b", repr(float(expand_base)), "-a", repr(float(density_alpha))]

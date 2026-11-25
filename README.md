@@ -12,7 +12,7 @@ uv run kobayashi-pw data/g1.txt --upper 10        # decision mode: stops once pw
 uv run kobayashi-pw data/g1.txt --alg1 11         # the paper's Algorithm 1 run literally, for cross-checks
 uv run kobayashi-pw data/sq63.txt --greedy2       # second greedy rule (Coudert et al. 2014): same pw, fewer sets
 uv run kobayashi-pw data/sq63.txt --reverse       # print the ordering in the frontier-DP convention
-make                                              # builds src/C/kpw (see "Building" below for kpw2)
+make -C src/C                                     # optional: the programs are compiled on first use (see "Building")
 src/C/kpw2 -q -t 0 data/sq75.txt                  # n up to 128, all cores
 src/C/kpw2 -q -x data/sq75.txt                    # compact table: store only the arc label
 src/C/kpw -c -o sq63.dag data/sq63.txt            # complete mode: DAG of all relevant pw-optimal orderings
@@ -34,15 +34,23 @@ The C programs (`src/C/edgelist.h`) and the Python reader (`kobayashi_pw.io.numb
 
 ### Building
 
+**No build step is needed.** The C programs (kpw, kpw2, kopt, kcw, bab, fullcount) are compiled on first use by `kobayashi_pw.native`, which works the same for a source tree, an editable install and an installed wheel.
+
+- **Sources.** The wheel ships the sources as `kobayashi_pw/_csrc`. In the repository they stay in `src/C`, and `pyproject.toml` (hatchling) maps them into the wheel.
+- **Compilation** uses `cc -O3 -march=native` (`$CC` overrides the compiler). The binary goes to `~/.cache/kobayashi_pw/bin/<key>/` (`$KPW_CACHE` overrides the location).
+- **The cache key** covers the source, the headers, the flags, the compiler version and the machine type, so an edited source is rebuilt on the next call.
+- **Word count.** kpw2 and kopt are built with the word count W that n requires (n ≤ 64·W, with W ∈ {1, 2, 3, 4, 8, 16}), so there is no fixed n ≤ 128 limit.
+- **Concurrency.** Concurrent processes compile once, under a file lock.
+
 ```
-cc -O3 -march=native -o src/C/kpw src/C/kpw.c
-cc -O3 -march=native -pthread -o src/C/kpw2 src/C/kpw2.c            # n <= 128
-cc -O3 -march=native -pthread -DW=3 -o src/C/kpw2_192 src/C/kpw2.c  # n <= 192, etc.
-cc -O3 -march=native -o src/C/bab src/C/bab.c                        # Coudert et al. BAB (for comparison)
-cc -O3 -march=native -o src/C/kcw src/C/kcw.c                        # exact cutwidth
+uv run kobayashi-pw-build                  # optional: compile everything now (e.g. before a batch job)
+uv run kobayashi-pw-build --n 200 kpw2     # kpw2 for n <= 256
+KPW_BIN_KPW2=/path/to/kpw2 ...             # use a hand-built binary instead
 ```
 
-`kobayashi-pw-orders` uses `src/C/kpw` for n ≤ 64 and `src/C/kpw2` beyond that, falling back to Python if neither is built. Pass `--threads N` to give kpw2 N threads.
+From Python, `kobayashi_pw.native.program(name, n)` returns the path; `try_program` returns `None` when no compiler is available. `kobayashi-pw-orders` uses kpw for n ≤ 64 and kpw2 beyond that, and falls back to Python if neither can be compiled. Pass `--threads N` to give kpw2 N threads.
+
+`make -C src/C` still builds the programs in place, for development and benchmarks.
 
 ### Embedded DSL (`src/kobayashi_pw/dsl/`): specifications compiled to C on demand
 
@@ -103,7 +111,7 @@ Models:
 
 `-L` keeps at most that many labels per node; the output then reports `exact=0`. The ordering is printed in the frontier-DP direction, with the file's vertex names.
 
-From Python, call `orders.optimize_file(path, cost, beta=..., ...)`. The build is `make kopt`, needs `-lm`, and handles n ≤ 128 by default (`-DW=k` for n ≤ 64k).
+From Python, call `orders.optimize_file(path, cost, beta=..., ...)`. kopt is compiled on first use with the word count the DAG needs (see "Building").
 
 Agreement with `optimize` is tested (`tests/test_kopt.py`): the same cost to 1e-9, and equality with brute-force path enumeration on random graphs, with and without `-g`. On the square-sum graphs the orderings are identical to Python's.
 

@@ -314,3 +314,26 @@ The editable path source remains an option for development. Nothing else in hami
 1. **Build backend.** Is switching to hatchling acceptable if `uv_build` cannot include `src/C`? The alternative is to move the C sources under `src/kobayashi_pw/`, against the repo convention.
 2. **Default for the hampath work model.** Should it live in kobayashi-pw (as `model_v7` does now, in `orders.py` and as a DSL spec), or in hamiltonian, which would pass the spec to the DSL? I lean to kobayashi-pw for V2 and V7, which are already there, and hamiltonian for the work model, since its features and fit belong to that repo. The DSL's `param` mechanism makes either work.
 3. **`kopt.c` after acceptance.** Keep it as the reference implementation, or retire it once the DSL path is the default?
+
+## Status
+
+**Part B implemented (2026-11-24).**
+
+- **`kobayashi_pw/native.py`.** `program`, `try_program` and the `kobayashi-pw-build` command. The DSL's `jit.py` now takes its source directory, cache directory and compiler from it.
+- **Packaging.** hatchling, with each C source and header force-included as `kobayashi_pw/_csrc/<file>`; files are listed one by one so that binaries never enter the wheel.
+- **Call sites switched:** `orders.find_kopt` (W chosen from the DAG file's header), `orders_cli._find_kpw`, and hamiltonian's `ham_kpw.find_kpw`.
+- **`tests/test_native.py`:**
+  - each program compiles once and is cached;
+  - edited sources and headers change the key;
+  - the W buckets, including kpw2 on a 150-vertex graph;
+  - the kpw n ≤ 64 limit;
+  - four concurrent processes give one compilation;
+  - the `KPW_BIN_*` override, and the behaviour without a compiler;
+  - the wheel's file list against `native.PROGRAMS` and the headers.
+- **Acceptance (B6.4).** A wheel built with `pip wheel .` contains only sources under `_csrc`. Installed into an empty virtual environment and run outside the source tree, it compiled and ran:
+  - `kobayashi-pw-orders` (kpw, n = 63);
+  - `kpw2` (n = 75, W = 2);
+  - `kopt` (the V7 optimum at n = 75, 1.107831, as before);
+  - a DSL `vertex_separation` solve.
+
+The root file `build.toml` still contains the old `uv_build` `[build-system]` table. Nothing reads it (`pyproject.toml` is what counts), so I left it alone.

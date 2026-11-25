@@ -24,16 +24,10 @@ from .orders import (OrderDAG, evaluate, k_best, make_model_v7, model_v2,
 
 
 def _find_kpw(explicit: str | None, n: int) -> str | None:
-    """kpw for n <= 64, kpw2 (n <= 128 with the default build) otherwise."""
-    if explicit:
-        return explicit
-    here = os.path.dirname(os.path.abspath(__file__))
-    names = ("kpw", "kpw2") if n <= 64 else ("kpw2",)
-    for name in names:
-        for cand in (os.path.join(here, "..", "C", name), shutil.which(name)):
-            if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
-                return cand
-    return None
+    """kpw for n <= 64, kpw2 otherwise, compiled on first use (native.py);
+    None if no C compiler is available (the DAG is then built in Python)."""
+    from .native import try_program
+    return try_program("kpw" if n <= 64 else "kpw2", n, explicit=explicit)
 
 
 def build_dag(g: Graph, greedy2: bool, kpw: str | None, threads: int = 1) -> OrderDAG:
@@ -76,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--greedy2", action="store_true",
                     help="smaller DAG via Coudert et al.'s second greedy rule (fewer orderings)")
     ap.add_argument("--kpw", default=None,
-                    help="path to kpw or kpw2 (default: src/C/kpw for n <= 64, else src/C/kpw2; or PATH)")
+                    help="path to kpw or kpw2 (default: compiled on first use; see native.py)")
     ap.add_argument("--threads", type=int, default=1, help="threads for kpw2 (0 = all cores)")
     ap.add_argument("--python", action="store_true", help="build the DAG in Python even if kpw exists")
     ap.add_argument("--profile", action="store_true", help="print the frontier profile of the result")

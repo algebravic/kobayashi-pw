@@ -9,6 +9,7 @@ dependencies = []
 [project.scripts]
 kobayashi-pw = "kobayashi_pw.cli:main"
 kobayashi-pw-orders = "kobayashi_pw.orders_cli:main"
+kobayashi-pw-build = "kobayashi_pw.native:main"
 
 [dependency-groups]
 dev = [
@@ -16,5 +17,23 @@ dev = [
 ]
 
 [build-system]
-requires = ["uv_build>=0.13.6,<0.14.0"]
-build-backend = "uv_build"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kobayashi_pw"]
+
+# The C sources stay in src/C (repo convention) and ship inside the package as
+# kobayashi_pw/_csrc, where native.py compiles them on first use.  Files are
+# listed one by one so that binaries built in src/C never enter the wheel;
+# tests/test_native.py checks this list against native.PROGRAMS and the headers.
+[tool.hatch.build.targets.wheel.force-include]
+"src/C/kpw.c" = "kobayashi_pw/_csrc/kpw.c"
+"src/C/kpw2.c" = "kobayashi_pw/_csrc/kpw2.c"
+"src/C/kopt.c" = "kobayashi_pw/_csrc/kopt.c"
+"src/C/kcw.c" = "kobayashi_pw/_csrc/kcw.c"
+"src/C/bab.c" = "kobayashi_pw/_csrc/bab.c"
+"src/C/fullcount.c" = "kobayashi_pw/_csrc/fullcount.c"
+"src/C/edgelist.h" = "kobayashi_pw/_csrc/edgelist.h"
+"src/C/dsl_rt.h" = "kobayashi_pw/_csrc/dsl_rt.h"
+"src/C/dsl_engine.h" = "kobayashi_pw/_csrc/dsl_engine.h"

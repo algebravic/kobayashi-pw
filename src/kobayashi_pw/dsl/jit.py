@@ -22,15 +22,7 @@ CFLAGS = ["-O3", "-march=native", "-shared", "-fPIC"]
 DEBUG_CFLAGS = ["-O1", "-g", "-shared", "-fPIC", "-fsanitize=undefined"]
 
 
-def c_dir() -> Path:
-    env = os.environ.get("KPW_ENGINE")
-    if env:
-        return Path(env)
-    return Path(__file__).resolve().parents[2] / "C"
-
-
-def cache_dir() -> Path:
-    return Path(os.environ.get("KPW_CACHE", Path.home() / ".cache" / "kobayashi_pw"))
+from ..native import c_dir, cache_dir          # one source directory and cache for all C code
 
 
 TABLE_DEFAULTS = {"KPW_TABLE_PART_BITS": 8, "KPW_PREFETCH": 1}
@@ -59,23 +51,7 @@ def machine_config() -> dict:
     return cfg
 
 
-def compiler() -> str | None:
-    for c in (os.environ.get("CC"), "cc", "gcc", "clang"):
-        if c and shutil.which(c):
-            return c
-    return None
-
-
-_cc_ident: dict = {}
-
-
-def _ident(cc: str) -> str:
-    if cc not in _cc_ident:
-        try:
-            _cc_ident[cc] = subprocess.run([cc, "--version"], capture_output=True, text=True).stdout
-        except OSError:
-            _cc_ident[cc] = cc
-    return _cc_ident[cc]
+from ..native import compiler, compiler_ident as _ident
 
 
 def w_bucket(n: int) -> int:

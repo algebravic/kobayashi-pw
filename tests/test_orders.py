@@ -12,7 +12,8 @@ from kobayashi_pw.orders import (OrderDAG, evaluate, k_best, model_v2, model_v7,
 
 from .test_core import brute
 
-KPW = os.path.join(os.path.dirname(__file__), "..", "src", "C", "kpw")
+from kobayashi_pw.native import try_program
+KPW = try_program("kpw") or os.path.join(os.path.dirname(__file__), "..", "src", "C", "kpw")
 
 
 def frontier_widths(g, tau):

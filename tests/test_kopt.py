@@ -13,9 +13,10 @@ from kobayashi_pw.orders import (OrderDAG, WORK_FEATURES, evaluate, find_kopt,
                                  make_model_loglin, make_model_v7, model_v2, optimize,
                                  optimize_file)
 
-KPW = os.path.join(os.path.dirname(__file__), "..", "src", "C", "kpw")
+from kobayashi_pw.native import try_program
+KPW = try_program("kpw") or os.path.join(os.path.dirname(__file__), "..", "src", "C", "kpw")
 pytestmark = pytest.mark.skipif(find_kopt() is None or not os.path.isfile(KPW),
-                                reason="kopt or kpw not built (make -C src/C kpw kopt)")
+                                reason="kopt or kpw unavailable (no C compiler)")
 
 
 def random_graph(rng, n, p):
