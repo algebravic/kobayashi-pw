@@ -9,7 +9,7 @@ S are hoisted out of the move loop.
 """
 from __future__ import annotations
 
-from .ir import BINDERS, FULL, Node, SET, SEQ, INT, BOOL, VERT, walk
+from .ir import BINDERS, FULL, Node, SET, SEQ, INT, BOOL, VERT, REAL, walk
 
 WI = "@W@"     # placeholder for the word index in word templates
 
@@ -29,6 +29,11 @@ class Lowerer:
         self.tmp = 0
         self.cset_idx = {c: i for i, c in enumerate(prob.const_order)}
         self.vfun_idx = {v: i for i, v in enumerate(prob.vfun_order)}
+        self.param_off = {}
+        off = 0
+        for name, (size, _) in getattr(prob, "params_decl", {}).items():
+            self.param_off[name] = off
+            off += size
 
     # ------------------------------------------------------------ utils
     def emit(self, s: str):
@@ -63,6 +68,9 @@ class Lowerer:
         hit = self.lookup(node)
         if hit is not None and hit[0] == "w":
             return hit[1]
+        sm = getattr(self, "secmaint", None)
+        if sm and node in sm:
+            return sm[node]
         if op == "var":
             arr, _ = self.env[a[0]]
             return f"{arr}[{WI}]"
@@ -224,6 +232,13 @@ class Lowerer:
             return self.store(node, self.scalar(f"(({self.int(a[0])}) & 1)"))
         if op == "deg":
             return self.store(node, self.scalar(f"K->DEG[{self.int(a[0])}]"))
+        if op == "bwidth":
+            return "BW"
+        if op == "nverts":
+            return "K->n"
+        if op in ("rlt", "rle"):
+            cmp = "<" if op == "rlt" else "<="
+            return self.store(node, self.scalar(f"({self.real(a[0])} {cmp} {self.real(a[1])})"))
         if op == "card":
             x = a[0]
             fam = self.family_read(x)
@@ -286,6 +301,88 @@ class Lowerer:
         self.emit(f"int {r} = {expr};")
         return r
 
+    # ------------------------------------------------------------ reals
+    def dscalar(self, expr):
+        r = self.new("d")
+        self.emit(f"double {r} = {expr};")
+        return r
+
+    def real(self, node) -> str:
+        if node.type != REAL:
+            return f"((double)({self.int(node)}))"
+        hit = self.lookup(node)
+        if hit is not None:
+            return hit
+        op, a = node.op, node.args
+        if op == "real":
+            x = a[0]
+            if x != x or x in (float("inf"), float("-inf")):
+                return {"inf": "INFINITY", "-inf": "(-INFINITY)"}.get(repr(x), "NAN")
+            return f"({x!r})" if ("." in repr(x) or "e" in repr(x)) else f"({x!r}.0)"
+        if op == "toreal":
+            return self.store(node, self.dscalar(f"(double)({self.int(a[0])})"))
+        bin_ = {"radd": "+", "rsub": "-", "rmul": "*", "rdiv": "/"}
+        if op in bin_:
+            return self.store(node, self.dscalar(f"({self.real(a[0])} {bin_[op]} {self.real(a[1])})"))
+        if op in ("rexp", "rlog"):
+            return self.store(node, self.dscalar(f"{op[1:]}({self.real(a[0])})"))
+        if op == "rpow":
+            return self.store(node, self.dscalar(f"pow({self.real(a[0])}, {self.real(a[1])})"))
+        if op in ("rmin", "rmax"):
+            x, y = self.real(a[0]), self.real(a[1])
+            cmp = "<" if op == "rmin" else ">"
+            # Python min(x, y) / max(x, y): y only if strictly better
+            return self.store(node, self.dscalar(f"(({y}) {cmp} ({x}) ? ({y}) : ({x}))"))
+        if op == "where":
+            return self.store(node, self.dscalar(f"(({self.int(a[0])}) ? ({self.real(a[1])}) : ({self.real(a[2])}))"))
+        if op == "table":
+            name = a[0]
+            n = len(self.p.tables[name])
+            i = self.int(a[1])
+            return self.store(node, self.dscalar(
+                f"TAB_{name}[({i}) < 0 ? 0 : (({i}) > {n - 1} ? {n - 1} : ({i}))]"))
+        if op == "param":
+            return self.store(node, self.dscalar(f"PV[{self.param_off[a[0]] + a[1]}]"))
+        if op == "comp_sum":
+            return self.store(node, self.comp_sum(node))
+        raise CodegenError(f"cannot lower real expression {op} to C")
+
+    def comp_sum(self, node) -> str:
+        """Σ over the components C of G[A] of body(|C|): BFS on bitsets."""
+        A, k, body = node.args
+        tmpl = self.word(A)
+        r, rest, comp, front, nx = (self.new("d"), self.new("rest"), self.new("comp"),
+                                    self.new("front"), self.new("nx"))
+        self.emit(f"double {r} = 0.0;")
+        self.emit(f"u64 {rest}[W]; for (int w = 0; w < W; w++) {rest}[w] = {tmpl.replace(WI, 'w')};")
+        self.emit("for (;;) {")
+        self.push()
+        seed, sz = self.new("seed"), self.new("sz")
+        self.emit(f"int {seed} = -1;")
+        self.emit(f"for (int w = 0; w < W; w++) if ({rest}[w]) {{ {seed} = w * 64 + __builtin_ctzll({rest}[w]); break; }}")
+        self.emit(f"if ({seed} < 0) break;")
+        self.emit(f"u64 {comp}[W], {front}[W];")
+        self.emit(f"for (int w = 0; w < W; w++) {comp}[w] = 0;")
+        self.emit(f"{comp}[{seed} >> 6] = 1ULL << ({seed} & 63);")
+        self.emit(f"for (int w = 0; w < W; w++) {front}[w] = {comp}[w];")
+        self.emit("for (;;) {")
+        self.ind += 1
+        self.emit(f"u64 {nx}[W]; int any = 0;")
+        self.emit(f"for (int w = 0; w < W; w++) {nx}[w] = 0;")
+        self.emit(f"for (int w = 0; w < W; w++) {{ u64 m = {front}[w]; while (m) {{ int u = w * 64 + __builtin_ctzll(m); m &= m - 1;")
+        self.emit(f"    for (int z = 0; z < W; z++) {nx}[z] |= K->NB[u * W + z]; }} }}")
+        self.emit(f"for (int w = 0; w < W; w++) {{ {nx}[w] &= {rest}[w] & ~{comp}[w]; {comp}[w] |= {nx}[w]; {front}[w] = {nx}[w]; any |= {nx}[w] != 0; }}")
+        self.emit("if (!any) break;")
+        self.ind -= 1
+        self.emit("}")
+        self.emit(f"int {sz} = 0;")
+        self.emit(f"for (int w = 0; w < W; w++) {{ {sz} += __builtin_popcountll({comp}[w]); {rest}[w] &= ~{comp}[w]; }}")
+        self.env[k.args[0]] = sz
+        self.emit(f"{r} += {self.real(body)};")
+        self.pop()
+        self.emit("}")
+        return r
+
 
 def _closure_trigger_ok(prob, pred):
     """S occurs in pred only inside N(v) ∩ S (so pred changes only when a neighbour is added)."""
@@ -315,8 +412,11 @@ def guard_split(prob, pred):
     return None, pred
 
 
-def generate(prob) -> str:
-    """C source of the ops for prob (to be compiled with dsl_rt.h / dsl_engine.h)."""
+def generate(prob, secondary: bool = False) -> str:
+    """C source of the ops for prob (to be compiled with dsl_rt.h / dsl_engine.h).
+    With secondary=True, also the functions of engine E2 (dsl_dagopt.h): dag_arcs, the
+    secondary step functions and sec_block; the closure is then the sweep, so that blocks
+    have the order of eager mode, core.expand and kopt (obligation S1)."""
     p = prob
     maint = {m: i for i, m in enumerate(p.maintained)}
     nm = len(maint)
@@ -369,7 +469,8 @@ def generate(prob) -> str:
     out += fn("static inline void st_del(u64 *S, Mt *mt, int u, const Consts *K)", b_del)
 
     # closure
-    trig = all(_closure_trigger_ok(p, c.pred) for c in p.closures) and p.ann.get("closure", "auto") != "sweep"
+    trig = (all(_closure_trigger_ok(p, c.pred) for c in p.closures) and p.ann.get("closure", "auto") != "sweep"
+            and not secondary)
     def b_clo(L):
         L.env[p.S_name] = ("T", "mt")
         L.emit("(void)K; (void)mt; (void)cand;")
@@ -591,4 +692,118 @@ def generate(prob) -> str:
         apply_move(L, rec=True)
         L.emit("return nr;")
     out += fn("static int replay(const u64 *S, const Mt *mt, int x, int *rec, const Consts *K)", b_replay)
+    if secondary:
+        out += _secondary_ops(p, fn, apply_move, hoist, inplace)
     return "\n".join(out) + "\n"
+
+
+def _secondary_ops(p, fn, apply_move, hoist, inplace) -> list[str]:
+    """dag_arcs (the arcs of the optimal move graph out of one state), the step functions
+    of every secondary clause, and sec_block (the τ-steps of one σ-arc)."""
+    out = [f"#define DSL_SECONDARY {len(p.secondaries)}", "#include <math.h>"]
+    for name, vals in p.tables.items():
+        out.append(f"static const double TAB_{name}[{len(vals)}] = {{{', '.join(repr(float(v)) for v in vals)}}};")
+
+    def b_arcs(L):
+        """For every move of cost <= B: apply (recording the block), look up the target."""
+        L.emit("const Consts *K = E->K;")
+        L.emit("u64 T[W], key[W], cand[W]; int nr = 0; int rec[64 * W]; int pre[64 * W]; (void)pre; int na = 0;")
+        if inplace:
+            L.emit("Mt mt2 = *mt;")
+            L.emit("for (int w = 0; w < W; w++) T[w] = S[w];")
+            L.env[p.S_name] = ("T", "(&mt2)")
+        else:
+            L.emit("Mt mt2;")
+            L.env[p.S_name] = ("S", "mt")
+        hoist(L)
+
+        def body():
+            L.env[p.x_name] = "x"
+            for f in p.choice_filters:
+                c = L.bool(f)
+                L.emit(f"if (!({c})) continue;")
+            cost = p.move.cost if p.move.cost is not None else p.derived_cost
+            c = L.int(cost)
+            L.emit(f"if ({c} > B) continue;")
+            L.emit("{")
+            L.ind += 1
+            apply_move(L, rec=True, inplace=inplace)
+            L.emit("make_key(T, key, K);")
+            L.emit("long tid = eng_find_h(E, key, hkey(key), NULL);")
+            L.emit("cb(ctx, x, tid, rec, nr); na++;")
+            if inplace:
+                L.emit("for (int k = nr; k-- > 0;) st_del(T, &mt2, rec[k], K);")
+            L.ind -= 1
+            L.emit("}")
+        L.foreach(p.move.over_minus_S, "x", body)
+        L.emit("return na;")
+    out += fn("static int dag_arcs(Eng *E, const u64 *S, const Mt *mt, int B, "
+              "void (*cb)(void *, int, long, const int *, int), void *ctx)", b_arcs)
+
+    # Finite differencing along a block (Layer D): ⋃_{u ∉ T} F(u) and ⋃_{u ∉ T+v} F(u) are
+    # unions over the σ-side sets C_j = V ∖ T, which grow by one vertex per σ-step.  sec_block
+    # computes them as prefix unions (one row OR per block vertex) and the step reads them,
+    # instead of recomputing a union over the whole complement at every step.
+    Tn, vn = p.T.node, p.v.node
+    comp_before = Node("sub", (FULL, Tn), SET)
+    comp_after = Node("sub", (FULL, Node("or", (Tn, Node("single", (vn,), SET)), SET)), SET)
+    rows = {"N": "K->NB", "Nin": "K->NIN", "Nout": "K->NOUT"}
+    used = set()
+    for sec in p.secondaries.values():
+        for x in (sec.a, sec.e, sec.k):
+            for m in walk(x):
+                if m.op == "bigunion" and m.args[1] in rows and m.args[0] in (comp_before, comp_after):
+                    used.add(m.args[1])
+    fams = sorted(used)
+    NF = max(1, len(fams))
+    secmaint = {}
+    for fi, F in enumerate(fams):
+        secmaint[Node("bigunion", (comp_before, F), SET)] = f"Ub[{fi} * W + {WI}]"
+        secmaint[Node("bigunion", (comp_after, F), SET)] = f"Ua[{fi} * W + {WI}]"
+
+    names = list(p.secondaries)
+    for i, name in enumerate(names):
+        sec = p.secondaries[name]
+
+        def b_step(L, sec=sec):
+            L.secmaint = secmaint
+            L.env["T"] = ("Tset", None)
+            L.env[p.v_name] = "v"
+            L.emit("(void)K; (void)PV; (void)BW; (void)Ub; (void)Ua;")
+            a, e, k = L.real(sec.a), L.real(sec.e), L.real(sec.k)
+            L.emit(f"out[0] = {a}; out[1] = {e}; out[2] = {k};")
+        out += fn(f"static inline void sec_step_{i}(const u64 *Tset, int v, const u64 *Ub, const u64 *Ua, "
+                  f"const Consts *K, const double *PV, int BW, double *out)  /* {name} */", b_step)
+
+    pre = [f"#define SEC_NF {NF}",
+           "/* the τ-steps of the σ-arc S -> S ∪ blk: τ adds blk reversed; before adding blk[j-1]",
+           " * the placed prefix is V ∖ C_j with C_j = S ∪ blk[0..j); pre[j] = ⋃_{u ∈ C_j} F(u) */",
+           "static int sec_block(int which, const u64 *S, const int *blk, int m, const Consts *K, const double *PV,",
+           "                     int BW, double (*out)[3]) {",
+           "    u64 C[W], Tb[W];",
+           "    u64 (*pre)[SEC_NF * W] = (u64 (*)[SEC_NF * W])__builtin_alloca((size_t)(m + 1) * sizeof *pre);",
+           "    for (int z = 0; z < SEC_NF * W; z++) pre[0][z] = 0;"]
+    for fi, F in enumerate(fams):
+        pre.append(f"    for (int w = 0; w < W; w++) {{ u64 q = S[w]; while (q) {{ int u = w * 64 + __builtin_ctzll(q); q &= q - 1;")
+        pre.append(f"        for (int z = 0; z < W; z++) pre[0][{fi} * W + z] |= {rows[F]}[u * W + z]; }} }}")
+    pre.append("    for (int j = 1; j <= m; j++) {")
+    pre.append("        for (int z = 0; z < SEC_NF * W; z++) pre[j][z] = pre[j - 1][z];")
+    for fi, F in enumerate(fams):
+        pre.append(f"        for (int z = 0; z < W; z++) pre[j][{fi} * W + z] |= {rows[F]}[blk[j - 1] * W + z];")
+    pre.append("    }")
+    pre += ["    for (int w = 0; w < W; w++) C[w] = S[w];",
+            "    for (int j = 0; j < m; j++) C[blk[j] >> 6] |= 1ULL << (blk[j] & 63);",
+            "    for (int j = m; j >= 1; j--) {",
+            "        int v = blk[j - 1];",
+            "        for (int w = 0; w < W; w++) Tb[w] = K->FULLW[w] & ~C[w];",
+            "        switch (which) {"]
+    out.append("\n".join(pre))
+    for i in range(len(names)):
+        out.append(f"        case {i}: sec_step_{i}(Tb, v, pre[j], pre[j - 1], K, PV, BW, out[m - j]); break;")
+    out.append("""        default: return -1;
+        }
+        C[v >> 6] &= ~(1ULL << (v & 63));
+    }
+    return m;
+}""")
+    return out

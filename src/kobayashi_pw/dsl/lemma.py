@@ -166,3 +166,60 @@ simplicial = Lemma("simplicial", "treewidth; v simplicial in the elimination gra
                    "eliminating v next is safe (tw(G_S) = max(deg v, tw(G_S − v)))", "standard")
 components = Lemma("components", "the width is the maximum over connected components",
                    "solve each component separately", "an ordering of a disjoint union can be concatenated")
+
+
+# ------------------------------------------------- secondary costs (Theorem E2)
+def nonneg(node, p=None) -> bool:
+    """Sign analysis: True if the Real/Int expression is provably >= 0.
+    Parameters count as nonnegative only if declared with nonneg=True."""
+    op, a = node.op, node.args
+    if op in ("int", "real"):
+        return a[0] >= 0
+    if op in ("card", "nverts", "bwidth", "deg", "cut"):
+        return True
+    if op == "toreal":
+        return nonneg(a[0], p)
+    if op in ("rexp",):
+        return True
+    if op == "rpow":
+        return nonneg(a[0], p)                    # x >= 0  =>  x^y >= 0 (or +inf)
+    if op in ("radd", "rmul", "rdiv", "add", "mul", "fdiv"):
+        return nonneg(a[0], p) and nonneg(a[1], p)
+    if op in ("rmax", "max"):
+        return nonneg(a[0], p) or nonneg(a[1], p)
+    if op in ("rmin", "min"):
+        return nonneg(a[0], p) and nonneg(a[1], p)
+    if op == "where":
+        return nonneg(a[1], p) and nonneg(a[2], p)
+    if op == "table":
+        return p is not None and a[0] in p.tables and all(x >= 0 for x in p.tables[a[0]])
+    if op == "param":
+        return p is not None and p.params_decl.get(a[0], (0, False))[1]
+    if op == "comp_sum":
+        return nonneg(a[2], p)
+    if op == "sum":
+        return nonneg(a[2], p)
+    return False
+
+
+def _is_zero(node) -> bool:
+    return node.op in ("int", "real") and node.args[0] == 0
+
+
+def _chk_additive(p, sec):
+    return None if _is_zero(sec.e) else "e is not the constant 0"
+
+
+def _chk_pareto_monotone(p, sec):
+    bad = [name for name, x in (("e", sec.e), ("k", sec.k)) if not nonneg(x, p)]
+    return None if not bad else f"cannot show {' and '.join(bad)} >= 0 by sign analysis"
+
+
+additive = Lemma(
+    "additive", "e = 0 at every step (the cost is a sum of a(T, v))",
+    "p stays 1; one label per DAG node suffices, and the k cheapest labels give the k best paths",
+    "doc/dsl_secondary_design.md §A2 (Theorem E2.2)", _chk_additive)
+pareto_monotone = Lemma(
+    "pareto_monotone", "e >= 0 and e·k >= 0 at every step",
+    "the cost-to-go J(s, p) is nondecreasing in p, so Pareto labels (cost, p) give the exact optimum",
+    "doc/dsl_secondary_design.md §A2 (Theorem E2.1); doc/pathwidth.tex", _chk_pareto_monotone)

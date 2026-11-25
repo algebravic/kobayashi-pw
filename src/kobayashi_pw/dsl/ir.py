@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import itertools
 
-SET, INT, BOOL, VERT, SEQ = "Set", "Int", "Bool", "Vertex", "Seq"
+SET, INT, BOOL, VERT, SEQ, REAL = "Set", "Int", "Bool", "Vertex", "Seq", "Real"
 
 _table: dict = {}
 _fresh = itertools.count()
@@ -43,7 +43,7 @@ class Node:
                 for a in self.args:
                     if isinstance(a, Node):
                         f |= a.free
-                if self.op in BINDERS:           # (A, var-node, body)
+                if self.op in BINDERS or self.op in INT_BINDERS:   # (A, var-node, body)
                     f = (self.args[0].free | (self.args[2].free - {self.args[1].args[0]}))
             self._free = f
         return self._free
@@ -51,6 +51,8 @@ class Node:
 
 # binders: args = (domain set, bound var node, body)
 BINDERS = {"filter", "seq", "sum", "forall", "exists"}
+# comp_sum binds an Int (the component size): args = (set, bound Int var node, body)
+INT_BINDERS = {"comp_sum"}
 
 
 def var(name, typ):
@@ -85,11 +87,28 @@ def _n(x, want=None):
         return Node("bool", (x,), BOOL)
     if isinstance(x, int):
         return Node("int", (x,), INT)
+    if isinstance(x, float):
+        return Node("real", (x,), REAL)
     raise TypeError(f"cannot use {x!r} in a specification")
 
 
 def wrap(node):
-    return {SET: SetE, INT: IntE, BOOL: BoolE, VERT: VertE, SEQ: SeqE}[node.type](node)
+    return {SET: SetE, INT: IntE, BOOL: BoolE, VERT: VertE, SEQ: SeqE, REAL: RealE}[node.type](node)
+
+
+def _toreal(node):
+    """Int -> Real (identity on Real)."""
+    if node.type == REAL:
+        return node
+    if node.type != INT:
+        raise TypeError(f"expected a number, got {node.type} ({pretty(node)})")
+    if node.op == "int":
+        return Node("real", (float(node.args[0]),), REAL)
+    return Node("toreal", (node,), REAL)
+
+
+def _is_real(o) -> bool:
+    return isinstance(o, float) or (isinstance(o, (Sym, Node)) and _n(o).type == REAL)
 
 
 def _chk(node, typ, what):
@@ -109,9 +128,16 @@ class SetE(Sym):
 
 class IntE(Sym):
     def _b(self, op, o, typ=INT):
+        if _is_real(o):                                   # Int op Real -> Real
+            return getattr(RealE(_toreal(self.node)), f"__{_ROP[op]}__")(o)
         return wrap(Node(op, (self.node, _chk(_n(o), INT, op)), typ))
     def _r(self, op, o):
+        if _is_real(o):
+            return getattr(RealE(_toreal(self.node)), f"__r{_ROP[op]}__")(o)
         return wrap(Node(op, (_chk(_n(o), INT, op), self.node), INT))
+    def __truediv__(self, o): return RealE(_toreal(self.node)) / o
+    def __rtruediv__(self, o): return o / RealE(_toreal(self.node)) if not isinstance(o, (int, float)) \
+        else RealE(_toreal(_n(o))) / RealE(_toreal(self.node))
     def __add__(self, o): return self._b("add", o)
     def __radd__(self, o): return self._r("add", o)
     def __sub__(self, o): return self._b("isub", o)
@@ -126,6 +152,31 @@ class IntE(Sym):
     def __ge__(self, o): return wrap(Node("le", (_chk(_n(o), INT, ">="), self.node), BOOL))
     def __eq__(self, o): return self._b("eq", o, BOOL)
     def __ne__(self, o): return wrap(Node("not", (self._b("eq", o, BOOL).node,), BOOL))
+    __hash__ = object.__hash__
+
+
+_ROP = {"add": "add", "isub": "sub", "mul": "mul", "lt": "lt", "le": "le", "eq": "eq"}
+
+
+class RealE(Sym):
+    """Real scalars (double in C, float in eager mode).  Ints are promoted."""
+    def _b(self, op, o, typ=REAL):
+        return wrap(Node(op, (self.node, _toreal(_n(o))), typ))
+    def _r(self, op, o):
+        return wrap(Node(op, (_toreal(_n(o)), self.node), REAL))
+    def __add__(self, o): return self._b("radd", o)
+    def __radd__(self, o): return self._r("radd", o)
+    def __sub__(self, o): return self._b("rsub", o)
+    def __rsub__(self, o): return self._r("rsub", o)
+    def __mul__(self, o): return self._b("rmul", o)
+    def __rmul__(self, o): return self._r("rmul", o)
+    def __truediv__(self, o): return self._b("rdiv", o)
+    def __rtruediv__(self, o): return self._r("rdiv", o)
+    def __neg__(self): return RealE(Node("rsub", (Node("real", (0.0,), REAL), self.node), REAL))
+    def __lt__(self, o): return self._b("rlt", o, BOOL)
+    def __le__(self, o): return self._b("rle", o, BOOL)
+    def __gt__(self, o): return wrap(Node("rlt", (_toreal(_n(o)), self.node), BOOL))
+    def __ge__(self, o): return wrap(Node("rle", (_toreal(_n(o)), self.node), BOOL))
     __hash__ = object.__hash__
 
 
@@ -179,6 +230,8 @@ def imax(a, b): return IntE(Node("max", (_chk(_n(a), INT, "max"), _chk(_n(b), IN
 
 def where(c, a, b):
     an, bn = _n(a), _n(b)
+    if an.type != bn.type and {an.type, bn.type} == {INT, REAL}:
+        an, bn = _toreal(an), _toreal(bn)
     if an.type != bn.type:
         raise TypeError("where: branches differ in type")
     return wrap(Node("where", (_chk(_n(c), BOOL, "where"), an, bn), an.type))
@@ -222,6 +275,45 @@ def forall(A, p):   return _binder("forall", A, p, BOOL, BOOL)
 def exists(A, p):   return _binder("exists", A, p, BOOL, BOOL)
 
 
+# ---------------------------------------------------------------- reals
+def real(x):  return RealE(_toreal(_n(x)))
+def rexp(x):  return RealE(Node("rexp", (_toreal(_n(x)),), REAL))
+def rlog(x):  return RealE(Node("rlog", (_toreal(_n(x)),), REAL))
+def rpow(x, y): return RealE(Node("rpow", (_toreal(_n(x)), _toreal(_n(y))), REAL))
+def rmin(a, b): return RealE(Node("rmin", (_toreal(_n(a)), _toreal(_n(b))), REAL))
+def rmax(a, b): return RealE(Node("rmax", (_toreal(_n(a)), _toreal(_n(b))), REAL))
+
+
+def table(name, i):
+    """Entry min(i, len-1) of the constant real table `name` (declared with Problem.table)."""
+    return RealE(Node("table", (name, _chk(_n(i), INT, "table")), REAL))
+
+
+def param(name, i=0):
+    """Entry i of the runtime real parameter vector `name` (declared with Problem.param)."""
+    if not isinstance(i, int):
+        raise TypeError("param index must be a Python int")
+    return RealE(Node("param", (name, i), REAL))
+
+
+def width():
+    """The width B* of the problem (known when the secondary cost is evaluated)."""
+    return IntE(Node("bwidth", (), INT))
+
+
+def nverts():
+    """The number of vertices n."""
+    return IntE(Node("nverts", (), INT))
+
+
+def comp_sum(A, g):
+    """Σ over the connected components C of G[A] of g(|C|), g: Int -> Real."""
+    a = _chk(_n(A), SET, "comp_sum")
+    k = var("κ", INT)
+    body = _toreal(_n(g(IntE(k))))
+    return RealE(Node("comp_sum", (a, k, body), REAL))
+
+
 def qset(S, v):
     """Q(S, v): vertices outside S+v reachable from v through S (eager only)."""
     return SetE(Node("qset", (_chk(_n(S), SET, "qset"), _chk(_n(v), VERT, "qset")), SET))
@@ -250,7 +342,7 @@ def subst(node, mapping):
         return node
     if node.op == "var":
         return mapping[node.args[0]]
-    if node.op in BINDERS:
+    if node.op in BINDERS or node.op in INT_BINDERS:
         a, u, b = node.args
         inner = {k: v for k, v in mapping.items() if k != u.args[0]}
         return Node(node.op, (subst(a, mapping), u, subst(b, inner)), node.type)
@@ -274,7 +366,8 @@ def walk(node):
 
 # ------------------------------------------------------------ pretty printer
 _INF = {"or": "∪", "and": "∩", "sub": "∖", "add": "+", "isub": "−", "mul": "·", "fdiv": "//",
-        "lt": "<", "le": "≤", "eq": "=", "land": "∧", "lor": "∨"}
+        "lt": "<", "le": "≤", "eq": "=", "land": "∧", "lor": "∨",
+        "radd": "+", "rsub": "−", "rmul": "·", "rdiv": "/", "rlt": "<", "rle": "≤"}
 
 
 def pretty(n) -> str:
@@ -283,8 +376,26 @@ def pretty(n) -> str:
     op, a = n.op, n.args
     if op == "var":
         return a[0]
-    if op in ("int", "bool"):
+    if op in ("int", "bool", "real"):
         return str(a[0])
+    if op == "toreal":
+        return pretty(a[0])
+    if op == "param":
+        return f"{a[0]}[{a[1]}]"
+    if op == "table":
+        return f"{a[0]}[{pretty(a[1])}]"
+    if op == "bwidth":
+        return "pw"
+    if op == "nverts":
+        return "n"
+    if op == "comp_sum":
+        return f"Σ_{{C comp of G[{pretty(a[0])}]}} {pretty(a[2]).replace('κ', '|C|')}"
+    if op in ("rexp", "rlog"):
+        return f"{op[1:]}({pretty(a[0])})"
+    if op == "rpow":
+        return f"{pretty(a[0])}^{pretty(a[1])}"
+    if op in ("rmin", "rmax"):
+        return f"{op[1:]}({pretty(a[0])}, {pretty(a[1])})"
     if op == "full":
         return "V"
     if op == "empty":

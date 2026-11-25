@@ -337,3 +337,30 @@ The editable path source remains an option for development. Nothing else in hami
   - a DSL `vertex_separation` solve.
 
 The root file `build.toml` still contains the old `uv_build` `[build-system]` table. Nothing reads it (`pyproject.toml` is what counts), so I left it alone.
+
+**Part A implemented (2026-11-24).**
+
+**What exists:**
+- **IR:** the Real type and the operations of §A6.
+- **Problem:** `secondary`, `param`, `table`, `solve(output="pareto", ...)`, `evaluate_secondary`, `check_secondary`, and `report()`/`pretty()` lines for secondary clauses.
+- **Lemmas:** `lemma.additive` and `lemma.pareto_monotone`, with the sign analysis of §A4.
+- **Engine E:** the complete mode (`Eng.complete`; `eng_run` shared by `dsl_solve` and `dsl_dagopt`).
+- **Codegen:** `dag_arcs`, the step functions and `sec_block`, with prefix unions for the frontier, and the sweep closure forced when secondary output is compiled.
+- **`src/C/dsl_dagopt.h`:** E2.
+- **Eager mode:** complete search, E2, and enumeration of every path for checking.
+- **`dsl/hampath.py`:** V2, V7 and the log-linear work form.
+- **Tests:** `tests/test_dsl_secondary.py`.
+
+**How it differs from the design:**
+- **Only `direction="reverse"`** (the frontier-DP direction) is implemented; `forward` raises `NotImplementedError`.
+- **The `k_best` and `sample` outputs are not in the DSL.** `orders.k_best` and `OrderDAG.sample` remain the way to get them.
+- **Pruning is implicit.** E2 does not build the pruned DAG first: a state with no labelled successor stays empty, which is the backward pass of §A7.1 done in the same loop. `output dag(file=...)` (writing KPWDAG3 from the DSL) is not implemented.
+- **Secondary output does not split components.** It solves the whole graph, because the secondary cost is not additive over components.
+- **Block order with `greedy2`.** The DSL applies its closure rules in one sweep, while `core.expand` reaches a rule-1 fixpoint before each rule-2 step. With `greedy2` the blocks can therefore differ from kopt's. The comparison with kopt is made without `greedy2`, as in hamiltonian.
+
+**Acceptance:**
+1. `check_secondary` passes: the E2 optimum equals the minimum over all paths, compiled equals eager, the fold equals evaluation of the whole ordering, and the ordering is width-optimal. This was run on 180 graph-and-cost pairs during development, and the tests run 2 × 40 graphs × 3 costs.
+2. The DSL equals `orders.optimize` on G₁₆–G₃₀, in both modes.
+3. The DSL equals kopt on G₄₀–G₇₅ for V2, V7 and work, with the same ordering in every case.
+4. Speed: `doc/dsl_codegen_perf.md`. On the optimisation proper the DSL takes 0.69–1.02× kopt's time, and 0.66–1.02× of kpw + kopt in total.
+5. Hamiltonian: `ham_count --ordering kpw --kpw-engine dsl` gives the same orderings as the kopt path (`tests/test_kpw.py::test_dsl_engine_equals_kopt`). It remains an option, with kopt as the default, until you decide otherwise.

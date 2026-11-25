@@ -77,6 +77,7 @@ typedef struct {
     int *cx; uint64_t *ch;            /* per-expansion candidate buffers (n entries) */
     long done;                        /* id of V, or -1 */
     int oom;
+    int complete;                     /* 1: finish level B* instead of stopping at V (DAG output) */
 } Eng;
 
 static inline uint64_t hkey(const u64 *k) {
@@ -188,7 +189,7 @@ static long eng_insert(Eng *E, const u64 *key, uint32_t parent, int x, const u64
 static inline int eng_offer_h(Eng *E, const u64 *key, uint64_t h, uint32_t parent, int x, int full, const u64 *cm) {
     long id = eng_insert_h(E, key, h, parent, x, cm);
     if (id < 0) return 0;
-    if (full) { E->done = id; return 1; }
+    if (full) { E->done = id; return !E->complete; }
     eng_push(E, (uint32_t)id, -1);
     return 0;
 }
@@ -196,7 +197,7 @@ static inline int eng_offer_h(Eng *E, const u64 *key, uint64_t h, uint32_t paren
 static inline int eng_offer(Eng *E, const u64 *key, uint32_t parent, int x, int full, const u64 *cm) {
     long id = eng_insert(E, key, parent, x, cm);
     if (id < 0) return 0;
-    if (full) { E->done = id; return 1; }
+    if (full) { E->done = id; return !E->complete; }
     eng_push(E, (uint32_t)id, -1);
     return 0;
 }

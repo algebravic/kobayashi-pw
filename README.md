@@ -67,6 +67,11 @@ treewidth().solve(small_graph, mode="eager")  # IR interpreter (the reference se
 
 The design is in `doc/dsl_design.md`, and the plan and results of the first milestone are in `doc/dsl_milestone1.md`. The generated vertex separation and cutwidth programs reproduce kpw and kcw: the same widths, and the same state counts on structured graphs. They run at 0.2–0.9× the hand-written programs' time, except for kpw's `-g`, where they take up to 1.45×.
 
+**Secondary costs** (`doc/dsl_secondary_design.md`). A spec can also declare `P.secondary(step, name, by=lemma.pareto_monotone | lemma.additive)`, where `step(T, v)` returns (a, e, k) for one step of the frontier-DP ordering. `solve(..., output="pareto", secondary=name, params=...)` then minimises that cost exactly over every optimal ordering of the move graph (engine E2, `src/C/dsl_dagopt.h`).
+- **IR.** It gains reals (`real`, `rexp`, `rlog`, `rpow`, `rmin`, `rmax`), constant tables, runtime parameters (`param`; refits need no recompilation), `width()`, `nverts()` and `comp_sum` over connected components.
+- **The hampath costs** V2, V7 and the log-linear work model are in `dsl/hampath.py`. They give the same orderings as `orders.optimize` and `kopt` (`tests/test_dsl_secondary.py`). `check_secondary()` compares E2 with brute-force enumeration of all paths on random graphs.
+- **Speed** relative to kopt is recorded in `doc/dsl_codegen_perf.md`.
+
 ### Lean formalisation (`lean/`)
 
 `lake exe cache get && lake build` in `lean/` checks machine proofs of:

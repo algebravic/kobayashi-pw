@@ -37,3 +37,4 @@ packages = ["src/kobayashi_pw"]
 "src/C/edgelist.h" = "kobayashi_pw/_csrc/edgelist.h"
 "src/C/dsl_rt.h" = "kobayashi_pw/_csrc/dsl_rt.h"
 "src/C/dsl_engine.h" = "kobayashi_pw/_csrc/dsl_engine.h"
+"src/C/dsl_dagopt.h" = "kobayashi_pw/_csrc/dsl_dagopt.h"
